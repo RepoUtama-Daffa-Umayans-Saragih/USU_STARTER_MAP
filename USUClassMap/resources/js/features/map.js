@@ -1,0 +1,4006 @@
+/**
+ * USUClassMap — Interactive 3D Geospatial & Spatial Intelligence Module (Mapbox GL JS 3D Engine)
+ *
+ * Mengadopsi Arsitektur Spasial & Estetika Huawei C.O.R.E.
+ * Fitur:
+ * - Mapbox GL JS 3D Engine (Perspective Pitch 50°, Bearing -15°, Vector 3D Extruded Buildings)
+ * - HUD Controls C.O.R.E. (2D/3D Perspective Toggle, Reset Campus Camera, 31 Mitra Fotokopi)
+ * - 5 Custom HTML Markers (Gedung Normal, Hasil Pencarian, Jadwal Saya Bintang, Mitra Fotokopi, Draggable Admin)
+ * - Custom Full-Bleed Popup (340px-360px) dengan Sticky Header & Visual Smart Room Cards
+ * - Smart Focus & Multi-Level Sorting: Target Room ke Index 0 & Target Schedule ke Index 0
+ * - Multi-Mode Media Modal (Foto, Tur 360° Pannellum, POV Video) & Google Maps Walk Navigation
+ * - Integrasi Penuh SPARQL API, Filter Hari, LocalStorage Recent Searches & Bookmarks
+ * - Zero Breaking Changes: Menjaga 100% Kontrak window.USUClassMap & Event Bus DOM
+ */
+
+import mapboxgl from 'mapbox-gl';
+
+// Bersihkan konteks WebGL saat berpindah atau me-refresh halaman agar tidak exhaust WebGL
+window.__usuMapDestroyed = false;
+window.__usuGpsWatchId = null;
+window.__usuPassiveGpsWatchId = null;
+window.__usuWibLiveTickerId = null;
+window.addEventListener('beforeunload', () => {
+    window.__usuMapDestroyed = true;
+    if (window.__usuWibLiveTickerId !== null) {
+        clearInterval(window.__usuWibLiveTickerId);
+        window.__usuWibLiveTickerId = null;
+    }
+    if (window.__usuPassiveGpsWatchId !== null && navigator.geolocation) {
+        try {
+            navigator.geolocation.clearWatch(window.__usuPassiveGpsWatchId);
+        } catch (e) {}
+        window.__usuPassiveGpsWatchId = null;
+    }
+    if (window.__usuGpsWatchId !== null && navigator.geolocation) {
+        try {
+            navigator.geolocation.clearWatch(window.__usuGpsWatchId);
+        } catch (e) {}
+        window.__usuGpsWatchId = null;
+    }
+    if (window.__usuMapInstance) {
+        try {
+            window.__usuMapInstance.remove();
+        } catch (e) {}
+        window.__usuMapInstance = null;
+    }
+});
+
+function initMapEngine() {
+    const mapElement = document.getElementById('map');
+    if (!mapElement) return;
+
+    // =========================================================================
+    // 1. STATE & SPATIAL CONFIGURATION (HUAWEI C.O.R.E. ADAPTATION)
+    // =========================================================================
+    // Koordinat Kampus USU Padang Bulan, Medan [Longitude, Latitude]
+    const DEFAULT_CENTER = [98.656520, 3.565245];
+    const DEFAULT_ZOOM = 16;
+    const DEFAULT_PITCH = 50;   // Kemiringan 3D Huawei C.O.R.E.
+    const DEFAULT_BEARING = -15; // Rotasi dinamis kamera Huawei C.O.R.E.
+    const RECENT_SEARCHES_KEY = 'usuclassmap_recent_searches';
+    const BOOKMARKS_KEY = 'usuclassmap_bookmarks';
+    const DEFAULT_MAP_STYLE = 'mapbox://styles/mapbox/streets-v12';
+    const SATELLITE_STORAGE_KEY = 'usuclassmap_satellite_mode';
+    const SATELLITE_SOURCE_ID = 'google-satellite-source';
+    const SATELLITE_LAYER_ID = 'google-satellite-layer';
+
+    let isSatelliteMode = false;
+    try {
+        const savedSatellite = localStorage.getItem(SATELLITE_STORAGE_KEY);
+        const legacyStyle = localStorage.getItem('usuclassmap_map_style');
+        if (savedSatellite === 'true' || (legacyStyle && legacyStyle.includes('satellite'))) {
+            isSatelliteMode = true;
+        }
+        if (legacyStyle) {
+            localStorage.removeItem('usuclassmap_map_style');
+            localStorage.setItem(SATELLITE_STORAGE_KEY, isSatelliteMode ? 'true' : 'false');
+        }
+    } catch (e) {}
+
+    const mapboxToken = window.MAPBOX_ACCESS_TOKEN 
+        || (typeof import.meta !== 'undefined' && import.meta.env?.VITE_MAPBOX_ACCESS_TOKEN) 
+        || '';
+
+    // Gunakan mapboxgl dari module import atau fallback CDN
+    const mb = window.mapboxgl || mapboxgl;
+    if (mb) {
+        mb.accessToken = mapboxToken;
+    }
+    if (typeof mapboxgl !== 'undefined' && mapboxgl) {
+        mapboxgl.accessToken = mapboxToken;
+    }
+
+    let map = null;
+    let is3DMode = true;
+    let buildingMarkers = {}; // building_id -> mapboxgl.Marker
+    let allBuildings = [];
+    let currentSchedules = [];
+    let userSchedules = [];
+    let userSchedulesByBuilding = {}; // building_code -> [schedule, ...]
+    let currentUser = null;
+    let activeDay = '';
+    let activeQuery = '';
+    let debounceTimer = null;
+
+    // Photocopy Layer State
+    let photocopyMarkers = [];
+    let allPhotocopyPlaces = [];
+    let isPhotocopyLayerActive = false;
+
+    // In-App Campus Routing & Auto-GPS State
+    const ROUTE_MAIN_SOURCE_ID = 'usu-route-main-source';
+    const ROUTE_ACCESS_SOURCE_ID = 'usu-route-access-source';
+    const GPS_ACCURACY_SOURCE_ID = 'usu-gps-accuracy-source';
+    const GPS_ACCURACY_FILL_LAYER_ID = 'usu-gps-accuracy-fill';
+    const GPS_ACCURACY_LINE_LAYER_ID = 'usu-gps-accuracy-line';
+    const ROUTE_ACCESS_LAYER_ID = 'usu-route-access-line';
+    const ROUTE_CASING_LAYER_ID = 'usu-route-main-casing';
+    const ROUTE_LINE_LAYER_ID = 'usu-route-main-line';
+    const ROUTE_ARROW_LAYER_ID = 'usu-route-arrows';
+
+    let routePanelOpen = false;
+    let routeOriginKey = '';
+    let routeOriginLabel = '';
+    let routeOriginSource = 'none'; // 'none' | 'gps' | 'manual_entity' | 'manual_map'
+    let routeDestinationKey = '';
+    let routeDestinationLabel = '';
+    let routeMode = 'walking';
+    let routeModeExplicitByUser = false;
+    let currentRouteResult = null;
+    let pickingOriginOnMap = false;
+    let routeOriginMarker = null;
+    let routeDestinationMarker = null;
+    let gpsUserMarker = null;
+    let lastGpsFix = null; // { lat, lng, accuracy, timestamp }
+    let liveGpsTracking = false;
+    let activeLocateRequestId = 0;
+    let routingDestinations = { buildings: [], fotocopy: [] };
+    let isRoutingDestinationsLoaded = false;
+    let pendingInitialRouteRequest = null;
+
+    /**
+     * Helper konversi koordinat Latitude & Longitude ke format Mapbox GL JS [Longitude, Latitude]
+     */
+    function toMapboxCoord(lat, lng) {
+        return [parseFloat(lng), parseFloat(lat)];
+    }
+
+    // =========================================================================
+    // 1B. REAL-TIME WIB OPERATIONAL STATUS & GPS SESSION HELPERS
+    // =========================================================================
+    const GPS_SESSION_TTL_MS = 5 * 60 * 1000;
+    const WIB_DAY_NAMES = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+    const WIB_WEEKDAY_MAP = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+    function getCurrentWibParts() {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: 'Asia/Jakarta',
+            weekday: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        }).formatToParts(new Date());
+        const mapParts = {};
+        parts.forEach((p) => { mapParts[p.type] = p.value; });
+        const hour = Number(mapParts.hour || 0) % 24;
+        const minute = Number(mapParts.minute || 0);
+        const dow = Object.prototype.hasOwnProperty.call(WIB_WEEKDAY_MAP, mapParts.weekday)
+            ? WIB_WEEKDAY_MAP[mapParts.weekday]
+            : new Date().getDay();
+        return {
+            hour,
+            minute,
+            dow,
+            minutesNow: (hour * 60) + minute,
+            clock: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+        };
+    }
+
+    function parseWibMinutes(hhmm, fallbackMin) {
+        const match = String(hhmm || '').replace('.', ':').match(/(\d{1,2}):(\d{2})/);
+        if (!match) return fallbackMin;
+        return (Math.min(23, Number(match[1])) * 60) + Math.min(59, Number(match[2]));
+    }
+
+    function isOperatingDayWib(operatingDays, dow) {
+        const lower = String(operatingDays || '').toLowerCase().trim();
+        if (!lower || lower.includes('setiap hari') || lower.includes('senin - minggu') || lower.includes('senin-minggu') || lower.includes('24 jam')) {
+            return true;
+        }
+        if (lower.includes('senin - jumat') || lower.includes('senin-jumat')) {
+            return dow >= 1 && dow <= 5;
+        }
+        return dow !== 0;
+    }
+
+    function nextOperatingDayLabelWib(operatingDays, dow) {
+        for (let offset = 1; offset <= 7; offset++) {
+            const cand = (dow + offset) % 7;
+            if (isOperatingDayWib(operatingDays, cand)) {
+                return offset === 1 ? 'besok' : WIB_DAY_NAMES[cand];
+            }
+        }
+        return 'Senin';
+    }
+
+    function evaluateBuildingWibStatus(building = null, wib = getCurrentWibParts()) {
+        const openTime = '07:00';
+        const closeTime = '16:00';
+        const openMin = 420;
+        const closeMin = 960;
+        const isSunday = wib.dow === 0;
+        const isOpenNow = !isSunday && wib.minutesNow >= openMin && wib.minutesNow < closeMin;
+
+        let detailText;
+        if (isOpenNow) {
+            detailText = `Buka sampai ${closeTime} WIB`;
+        } else if (isSunday) {
+            detailText = `Tutup (Hari Minggu) • Buka Senin pukul ${openTime} WIB`;
+        } else if (wib.minutesNow < openMin) {
+            detailText = `Belum buka • Buka pukul ${openTime} WIB`;
+        } else if (wib.dow === 6) {
+            detailText = `Sudah tutup • Buka Senin pukul ${openTime} WIB`;
+        } else {
+            detailText = `Sudah tutup • Buka besok pukul ${openTime} WIB`;
+        }
+
+        return {
+            is_open_now: isOpenNow,
+            status_code: isOpenNow ? 'open' : 'closed',
+            status_label: isOpenNow ? 'Buka' : 'Tutup',
+            hours_label: `${openTime} - ${closeTime} WIB`,
+            detail_text: detailText,
+            marker_color: isOpenNow ? '#10B981' : '#DC2626',
+            evaluated_at_wib: wib.clock
+        };
+    }
+
+    function evaluatePhotocopyWibStatus(place, wib = getCurrentWibParts()) {
+        const raw = place?.operational_status || place?.status || {};
+        const businessStatus = String(raw.business_status ?? place?.business_status ?? '').toUpperCase();
+        const rawDetail = String(raw.detail_text ?? '');
+        const openTime = String(raw.open_time || place?.open_time || '08:00').trim();
+        const closeTime = String(raw.close_time || place?.close_time || '21:00').trim();
+        const opDays = String(raw.operating_days || place?.operating_days || 'Senin - Sabtu').trim();
+
+        if (businessStatus === 'CLOSED_PERMANENTLY' || rawDetail === 'Tutup permanen') {
+            return {
+                is_open_now: false,
+                status_code: 'closed',
+                status_label: 'Tutup',
+                hours_label: `${openTime} - ${closeTime} WIB`,
+                detail_text: 'Tutup permanen',
+                marker_color: '#DC2626',
+                evaluated_at_wib: wib.clock
+            };
+        }
+
+        if (
+            businessStatus === 'CLOSED_TEMPORARILY'
+            || place?.is_active === false
+            || place?.is_open === false
+            || rawDetail === 'Tutup sementara'
+        ) {
+            return {
+                is_open_now: false,
+                status_code: 'closed',
+                status_label: 'Tutup',
+                hours_label: `${openTime} - ${closeTime} WIB`,
+                detail_text: 'Tutup sementara',
+                marker_color: '#DC2626',
+                evaluated_at_wib: wib.clock
+            };
+        }
+
+        if (String(raw.hours_label || '') === '24 Jam WIB' || rawDetail === 'Buka 24 Jam') {
+            return {
+                is_open_now: true,
+                status_code: 'open',
+                status_label: 'Buka',
+                hours_label: '24 Jam WIB',
+                detail_text: 'Buka 24 Jam',
+                marker_color: '#0D9488',
+                evaluated_at_wib: wib.clock
+            };
+        }
+
+        const isOpDay = isOperatingDayWib(opDays, wib.dow);
+        const openMin = parseWibMinutes(openTime, 480);
+        const closeMin = parseWibMinutes(closeTime, 1260);
+        let isOpenNow = false;
+        if (isOpDay) {
+            isOpenNow = closeMin < openMin
+                ? (wib.minutesNow >= openMin || wib.minutesNow < closeMin)
+                : (wib.minutesNow >= openMin && wib.minutesNow < closeMin);
+        }
+
+        let detailText;
+        if (isOpenNow) {
+            detailText = `Buka sampai ${closeTime} WIB`;
+        } else if (!isOpDay) {
+            detailText = `Tutup hari ini • Buka ${nextOperatingDayLabelWib(opDays, wib.dow)} pukul ${openTime} WIB`;
+        } else if (wib.minutesNow < openMin) {
+            detailText = `Belum buka • Buka pukul ${openTime} WIB`;
+        } else {
+            const nxt = isOperatingDayWib(opDays, (wib.dow + 1) % 7)
+                ? 'besok'
+                : nextOperatingDayLabelWib(opDays, wib.dow);
+            detailText = `Sudah tutup • Buka ${nxt} pukul ${openTime} WIB`;
+        }
+
+        return {
+            is_open_now: isOpenNow,
+            status_code: isOpenNow ? 'open' : 'closed',
+            status_label: isOpenNow ? 'Buka' : 'Tutup',
+            hours_label: `${openTime} - ${closeTime} WIB`,
+            detail_text: detailText,
+            marker_color: isOpenNow ? '#0D9488' : '#DC2626',
+            evaluated_at_wib: wib.clock
+        };
+    }
+
+    function readCachedGpsFromStorage() {
+        try {
+            const raw = sessionStorage.getItem('usu_last_gps_fix') || sessionStorage.getItem('usu_last_gps');
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            const lat = Number(parsed?.lat);
+            const lng = Number(parsed?.lng);
+            const ts = Number(parsed?.timestamp || 0);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || (Date.now() - ts) >= GPS_SESSION_TTL_MS) {
+                return null;
+            }
+            return {
+                lat,
+                lng,
+                accuracy: Number(parsed?.accuracy || 30),
+                timestamp: ts
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function syncGpsToSessionStorage(fix) {
+        if (!fix || !Number.isFinite(Number(fix.lat)) || !Number.isFinite(Number(fix.lng))) return;
+        try {
+            const payload = JSON.stringify({
+                lat: Number(fix.lat),
+                lng: Number(fix.lng),
+                accuracy: Number(fix.accuracy || 30),
+                timestamp: Number(fix.timestamp || Date.now())
+            });
+            sessionStorage.setItem('usu_last_gps_fix', payload);
+            sessionStorage.setItem('usu_last_gps', payload);
+        } catch (e) {}
+    }
+
+    function getDistanceInfoFromLastGps(lat, lng) {
+        const gps = lastGpsFix || readCachedGpsFromStorage();
+        const tLat = Number(lat);
+        const tLng = Number(lng);
+        if (!gps || !Number.isFinite(tLat) || !Number.isFinite(tLng)) return null;
+        const meters = haversineMetersJs(Number(gps.lat), Number(gps.lng), tLat, tLng);
+        if (!Number.isFinite(meters)) return null;
+        const label = meters < 1000
+            ? `${Math.max(1, Math.round(meters))} m`
+            : `${(meters / 1000).toFixed(2)} km`;
+        return {
+            meters: Math.round(meters),
+            label,
+            walkMinutes: Math.max(1, Math.round(meters / 75))
+        };
+    }
+
+    function formatPhotocopyPopupHtml(place, statusInfo = null) {
+        const op = statusInfo || evaluatePhotocopyWibStatus(place);
+        const isOpen = Boolean(op.is_open_now);
+        const lat = parseFloat(place.location?.latitude ?? place.latitude);
+        const lng = parseFloat(place.location?.longitude ?? place.longitude);
+        const gpsDist = getDistanceInfoFromLastGps(lat, lng);
+
+        const photoHtml = place.image_url
+            ? `<img src="${escapeHtmlSafe(place.image_url)}" alt="${escapeHtmlSafe(place.name)}" class="w-full h-28 object-cover rounded-t-xl">`
+            : '';
+
+        const statusBadge = isOpen
+            ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 shrink-0"><i class="fa-solid fa-circle text-[8px] text-[#10B981]"></i> Buka</span>`
+            : `<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#DC2626] text-white shrink-0"><i class="fa-solid fa-circle text-[8px] text-red-200"></i> Tutup</span>`;
+
+        const ratingScore = (typeof place.rating === 'object' && place.rating !== null)
+            ? (place.rating.score || '4.8')
+            : (place.rating || '4.8');
+
+        const userRatingCount = (typeof place.rating === 'object' && place.rating !== null)
+            ? (place.rating.user_rating_count || 50)
+            : (place.user_rating_count || 50);
+
+        const waUrl = (typeof place.contacts === 'object' && place.contacts !== null && place.contacts.whatsapp_url)
+            ? place.contacts.whatsapp_url
+            : (place.whatsapp_url || (place.whatsapp ? `https://wa.me/${String(place.whatsapp).replace(/[^0-9]/g, '')}` : 'https://wa.me/6285769737410'));
+
+        const locationName = (typeof place.location === 'object' && place.location !== null && place.location.name)
+            ? place.location.name
+            : (place.location_name || place.address || '');
+
+        const gpsLine = gpsDist
+            ? `<div class="text-[11px] font-bold text-[#10A760] flex items-center gap-1"><i class="fa-solid fa-person-walking"></i><span>${gpsDist.label} (~${gpsDist.walkMinutes} mnt jalan kaki dari GPS Anda)</span></div>`
+            : '';
+
+        return `
+            <div class="p-0 overflow-hidden font-sans">
+                ${photoHtml}
+                <div class="p-3.5 space-y-2">
+                    <div class="flex items-start justify-between gap-2">
+                        <h4 class="font-bold text-sm text-gray-900 leading-tight">${escapeHtmlSafe(place.name)}</h4>
+                        ${statusBadge}
+                    </div>
+                    <div class="text-[11px] font-semibold ${isOpen ? 'text-emerald-700' : 'text-[#DC2626]'}">
+                        ${escapeHtmlSafe(op.detail_text)} • ${escapeHtmlSafe(op.hours_label)}
+                    </div>
+                    ${gpsLine}
+                    <div class="flex items-center gap-1 text-xs text-amber-600 font-bold">
+                        <span><i class="fa-solid fa-star"></i> ${ratingScore}</span>
+                        <span class="text-gray-400 font-normal">(${userRatingCount} ulasan)</span>
+                    </div>
+                    <p class="text-xs text-gray-600 line-clamp-2">${escapeHtmlSafe(locationName)}</p>
+                    <div class="pt-2 border-t border-gray-100 flex items-center gap-1.5">
+                        <button type="button" onclick="window.USUClassMap && window.USUClassMap.startRouteTo('fotocopy:${place.id}')" class="py-1.5 px-2.5 bg-blue-50 hover:bg-blue-600 text-blue-700 hover:text-white font-bold text-xs rounded-lg text-center transition-colors cursor-pointer flex items-center gap-1" title="Arahkan Rute In-App ke Fotokopi">
+                            <i class="fa-solid fa-route"></i>
+                            <span>Rute</span>
+                        </button>
+                        <a href="/fotocopy/${place.id}" target="_blank" class="flex-1 py-1.5 px-2.5 bg-[#10A760] hover:bg-[#0D8A4E] text-white font-bold text-xs rounded-lg text-center shadow-xs transition-colors">
+                            Lihat & Pesan
+                        </a>
+                        <a href="${escapeHtmlSafe(waUrl)}" target="_blank" class="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg text-xs font-bold transition-colors" title="Chat WhatsApp">
+                            <i class="fa-solid fa-comment-dots"></i>
+                        </a>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    function applyBuildingMarkerVisualState(marker, wib = getCurrentWibParts()) {
+        if (!marker) return;
+        const el = marker.getElement?.();
+        const building = marker._usuEntityData;
+        if (!el || !building) return;
+
+        const op = evaluateBuildingWibStatus(building, wib);
+        const isOpen = Boolean(op.is_open_now);
+        const isHighlighted = Boolean(marker._usuIsHighlighted);
+        const hasMyClasses = Boolean(marker._usuHasMyClasses);
+        const markerColor = isOpen
+            ? (hasMyClasses && !isHighlighted ? '#EA580C' : (isHighlighted ? '#D4A017' : '#10B981'))
+            : '#DC2626';
+
+        el.setAttribute('data-entity-type', 'building');
+        el.setAttribute('data-entity-id', String(building.id));
+        el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+        el.setAttribute('data-marker-color', markerColor);
+
+        const circleEl = el.querySelector('[data-marker-circle="1"]');
+        if (circleEl) {
+            circleEl.style.backgroundColor = markerColor;
+            if (!isOpen) {
+                circleEl.classList.add('ring-2', 'ring-red-200/80');
+            } else {
+                circleEl.classList.remove('ring-2', 'ring-red-200/80');
+            }
+        }
+        const closedPill = el.querySelector('[data-marker-closed-pill="1"]');
+        if (closedPill) {
+            closedPill.classList.toggle('hidden', isOpen);
+        }
+
+        const popup = marker.getPopup?.();
+        if (popup) {
+            const existingMeta = marker._usuPopupMeta || {};
+            popup.setHTML(generateBuildingPopupContent(
+                building,
+                existingMeta.schedules || [],
+                Boolean(existingMeta.isUserSchedule),
+                existingMeta.targetRoomId || null,
+                existingMeta.targetRoomName || null,
+                existingMeta.targetScheduleId || null,
+                existingMeta.targetCourseCode || null,
+                existingMeta.targetCourseName || null
+            ));
+        }
+    }
+
+    function applyPhotocopyMarkerVisualState(marker, wib = getCurrentWibParts()) {
+        if (!marker) return;
+        const el = marker.getElement?.();
+        const place = marker._usuEntityData;
+        if (!el || !place) return;
+
+        const op = evaluatePhotocopyWibStatus(place, wib);
+        const isOpen = Boolean(op.is_open_now);
+        const markerColor = op.marker_color || (isOpen ? '#0D9488' : '#DC2626');
+
+        el.setAttribute('data-entity-type', 'fotocopy');
+        if (place.id) el.setAttribute('data-entity-id', String(place.id));
+        el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+        el.setAttribute('data-marker-color', markerColor);
+
+        const pillEl = el.querySelector('[data-marker-pill="1"]');
+        if (pillEl) {
+            pillEl.style.background = isOpen
+                ? 'linear-gradient(to right, #059669, #0D9488, #0891B2)'
+                : '#DC2626';
+        }
+        const tipEl = el.querySelector('[data-marker-tip="1"]');
+        if (tipEl) {
+            tipEl.style.backgroundColor = markerColor;
+        }
+        const closedPill = el.querySelector('[data-marker-closed-pill="1"]');
+        if (closedPill) {
+            closedPill.classList.toggle('hidden', isOpen);
+        }
+
+        const popup = marker.getPopup?.();
+        if (popup) {
+            popup.setHTML(formatPhotocopyPopupHtml(place, op));
+        }
+    }
+
+    function refreshDistanceDisplaysOnly() {
+        const wib = getCurrentWibParts();
+        Object.values(buildingMarkers).forEach((m) => applyBuildingMarkerVisualState(m, wib));
+        if (Array.isArray(photocopyMarkers)) {
+            photocopyMarkers.forEach((m) => applyPhotocopyMarkerVisualState(m, wib));
+        }
+        if (searchResultsContainer) {
+            searchResultsContainer.querySelectorAll('[data-sidebar-building-distance]').forEach((el) => {
+                const dist = getDistanceInfoFromLastGps(el.getAttribute('data-lat'), el.getAttribute('data-lng'));
+                if (dist) {
+                    el.textContent = `${dist.label} (~${dist.walkMinutes} mnt)`;
+                    el.classList.remove('hidden');
+                }
+            });
+        }
+    }
+
+    function refreshOperationalStatusesLive() {
+        const wib = getCurrentWibParts();
+        const clockEl = document.getElementById('map-wib-clock');
+        if (clockEl) {
+            clockEl.textContent = `WIB ${wib.clock}`;
+        }
+
+        Object.values(buildingMarkers).forEach((m) => applyBuildingMarkerVisualState(m, wib));
+        if (Array.isArray(photocopyMarkers)) {
+            photocopyMarkers.forEach((m) => applyPhotocopyMarkerVisualState(m, wib));
+        }
+
+        const bStatus = evaluateBuildingWibStatus(null, wib);
+        if (searchResultsContainer) {
+            searchResultsContainer.querySelectorAll('[data-sidebar-building-status]').forEach((el) => {
+                const isOpen = Boolean(bStatus.is_open_now);
+                el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+                el.className = isOpen
+                    ? 'px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800'
+                    : 'px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#DC2626] text-white';
+                el.textContent = isOpen ? 'Buka' : 'Tutup';
+            });
+            searchResultsContainer.querySelectorAll('[data-sidebar-building-distance]').forEach((el) => {
+                const dist = getDistanceInfoFromLastGps(el.getAttribute('data-lat'), el.getAttribute('data-lng'));
+                if (dist) {
+                    el.textContent = `${dist.label} (~${dist.walkMinutes} mnt)`;
+                    el.classList.remove('hidden');
+                }
+            });
+        }
+    }
+
+    function startPassiveGpsWarmup() {
+        const cached = readCachedGpsFromStorage();
+        if (cached) {
+            lastGpsFix = cached;
+            renderGpsLocationOnMap(cached.lat, cached.lng, cached.accuracy);
+            refreshDistanceDisplaysOnly();
+        }
+        if (!window.isSecureContext || !navigator.geolocation) return;
+
+        requestUserPosition2Stage(false)
+            .then(({ fix }) => {
+                if (window.__usuMapDestroyed || !fix) return;
+                lastGpsFix = fix;
+                syncGpsToSessionStorage(fix);
+                renderGpsLocationOnMap(fix.lat, fix.lng, fix.accuracy);
+                refreshDistanceDisplaysOnly();
+            })
+            .catch(() => {});
+
+        if (window.__usuPassiveGpsWatchId === null) {
+            try {
+                window.__usuPassiveGpsWatchId = navigator.geolocation.watchPosition(
+                    (pos) => {
+                        if (window.__usuMapDestroyed) return;
+                        const lat = Number(pos?.coords?.latitude);
+                        const lng = Number(pos?.coords?.longitude);
+                        const accuracy = Number(pos?.coords?.accuracy || 30);
+                        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+                        const moved = lastGpsFix
+                            ? haversineMetersJs(lastGpsFix.lat, lastGpsFix.lng, lat, lng)
+                            : 999;
+                        if (moved < 15 && lastGpsFix && (Date.now() - (lastGpsFix.timestamp || 0)) < 60000) {
+                            return;
+                        }
+
+                        const nextFix = { lat, lng, accuracy, timestamp: Date.now() };
+                        lastGpsFix = nextFix;
+                        syncGpsToSessionStorage(nextFix);
+                        renderGpsLocationOnMap(nextFix.lat, nextFix.lng, nextFix.accuracy);
+                        refreshDistanceDisplaysOnly();
+
+                        if (routePanelOpen && routeOriginSource === 'gps' && routeDestinationKey && moved >= 15) {
+                            applyGpsFixAsOrigin(nextFix, routeDestinationKey, true);
+                        }
+                    },
+                    () => {},
+                    { enableHighAccuracy: false, maximumAge: 30000, timeout: 15000 }
+                );
+            } catch (e) {}
+        }
+    }
+
+    // DOM Elements
+    const searchInput = document.getElementById('map-search-input');
+    const clearSearchBtn = document.getElementById('clear-search-btn');
+    const dayFilterContainer = document.getElementById('day-filters');
+    const searchResultsContainer = document.getElementById('search-results');
+    const resultsCountEl = document.getElementById('results-count');
+    const sourceBadgeEl = document.getElementById('source-badge');
+    const recentSearchesContainer = document.getElementById('recent-searches-container');
+
+    // =========================================================================
+    // 2. INITIALIZE MAPBOX GL JS 3D ENGINE
+    // =========================================================================
+    function initMap() {
+        const mapElement = document.getElementById('map');
+        if (!mapElement) {
+            console.error('[USUClassMap] Container #map tidak ditemukan.');
+            return;
+        }
+
+        if (!mb) {
+            console.error('[USUClassMap] Mapbox GL JS tidak terdeteksi.');
+            renderFallbackMapError(new Error('Pustaka Mapbox GL JS tidak terdeteksi. Periksa koneksi internet Anda.'));
+            return;
+        }
+
+        // Cek eksplisit dukungan WebGL sebelum Mapbox mencoba getContext
+        if (typeof mb.supported === 'function' && !mb.supported({ failIfMajorPerformanceCaveat: false })) {
+            const err = new Error('Browser atau kartu grafis (GPU) Anda saat ini tidak mengizinkan inisialisasi WebGL.');
+            console.error('[USUClassMap]', err);
+            renderFallbackMapError(err);
+            return;
+        }
+
+        // Pastikan container memiliki tinggi dan lebar valid (> 0px)
+        if (mapElement.clientWidth === 0 || mapElement.clientHeight === 0) {
+            mapElement.style.minHeight = '400px';
+            mapElement.style.height = '100%';
+            mapElement.style.width = '100%';
+        }
+
+        // Singleton pattern: bersihkan instance peta lama jika ada
+        if (window.__usuMapInstance) {
+            try {
+                window.__usuMapInstance.remove();
+            } catch (e) {
+                console.warn('[USUClassMap] Gagal membersihkan instance peta sebelumnya:', e);
+            }
+            window.__usuMapInstance = null;
+            map = null;
+        }
+
+        try {
+            window.__usuMapDestroyed = false;
+            map = new mb.Map({
+                container: 'map',
+                style: DEFAULT_MAP_STYLE,
+                center: DEFAULT_CENTER,
+                zoom: DEFAULT_ZOOM,
+                pitch: is3DMode ? DEFAULT_PITCH : 0,
+                bearing: is3DMode ? DEFAULT_BEARING : 0,
+                antialias: true,
+                failIfMajorPerformanceCaveat: false
+            });
+
+            window.__usuMapInstance = map;
+
+            // Tambahkan kontrol navigasi (Zoom & Compass/Pitch) di pojok kanan atas
+            map.addControl(new mb.NavigationControl({ visualizePitch: true }), 'top-right');
+
+            // Injeksi Layer Google Satellite & 3D Building Extrusions saat style selesai dimuat
+            map.on('style.load', () => {
+                injectSatelliteLayer();
+                inject3DBuildingsLayer();
+                ensureRouteLayers();
+                if (lastGpsFix) {
+                    renderGpsLocationOnMap(lastGpsFix.lat, lastGpsFix.lng, lastGpsFix.accuracy);
+                }
+                if (currentRouteResult) {
+                    renderActiveRouteOnMap(false);
+                }
+            });
+
+            map.on('click', (e) => {
+                if (!pickingOriginOnMap || !e?.lngLat) return;
+                const lat = Number(e.lngLat.lat);
+                const lng = Number(e.lngLat.lng);
+                if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+                pickingOriginOnMap = false;
+                activeLocateRequestId++;
+                stopLiveGpsTracking();
+                clearGpsVisuals();
+
+                try {
+                    map.getCanvas().style.cursor = '';
+                } catch (err) {}
+
+                const coordKey = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+                routeOriginKey = coordKey;
+                routeOriginLabel = `Titik Peta (${lat.toFixed(5)}, ${lng.toFixed(5)})`;
+                routeOriginSource = 'manual_map';
+
+                emitRouteState({
+                    isOpen: true,
+                    pickingOriginOnMap: false,
+                    originKey: routeOriginKey,
+                    originLabel: routeOriginLabel,
+                    originSource: routeOriginSource,
+                    diagnostic: null,
+                    alreadyAtDestinationMsg: '',
+                    statusMsg: routeDestinationKey ? 'Menghitung rute dari titik peta...' : 'Titik asal dipilih. Silakan pilih tujuan.',
+                    isError: false
+                });
+
+                if (routeOriginKey && routeDestinationKey) {
+                    fetchAndRenderRoute(routeOriginKey, routeDestinationKey, routeMode, { originLabel: routeOriginLabel });
+                }
+            });
+
+            updateSatelliteButtonState();
+
+            // Initialize Recent Searches UI
+            renderRecentSearches();
+
+            // Auto-warm GPS location & start 30-second live WIB operational status ticker
+            startPassiveGpsWarmup();
+            refreshOperationalStatusesLive();
+            if (window.__usuWibLiveTickerId !== null) {
+                clearInterval(window.__usuWibLiveTickerId);
+            }
+            window.__usuWibLiveTickerId = setInterval(() => {
+                if (!window.__usuMapDestroyed) {
+                    refreshOperationalStatusesLive();
+                }
+            }, 30000);
+
+            // Load Initial Buildings, Schedules, Routing Destinations & Photocopy Places sequentially
+            loadRoutingDestinations();
+            fetchBuildings().then(() => {
+                fetchUserSchedules().then(() => {
+                    handleInitialUrlParams();
+                });
+                loadPhotocopyPlaces();
+            });
+
+        } catch (err) {
+            console.error('[USUClassMap] Inisialisasi peta 3D/WebGL gagal:', err);
+            renderFallbackMapError(err);
+        }
+    }
+
+    /**
+     * Injeksi Raster Layer Google Satellite Hybrid (Citra Satelit + Label Jalan/POI)
+     * Tidak mengganti style Mapbox sehingga bebas context loss WebGL
+     */
+    function injectSatelliteLayer() {
+        if (!map) return;
+
+        if (!map.getSource(SATELLITE_SOURCE_ID)) {
+            map.addSource(SATELLITE_SOURCE_ID, {
+                type: 'raster',
+                tiles: [
+                    'https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                    'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                    'https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                    'https://mt3.google.com/vt/lyrs=y&x={x}&y={y}&z={z}'
+                ],
+                tileSize: 256,
+                attribution: '&copy; Google Maps'
+            });
+        }
+
+        if (!map.getLayer(SATELLITE_LAYER_ID)) {
+            const beforeLayerId = map.getLayer('3d-buildings') ? '3d-buildings' : undefined;
+            map.addLayer({
+                id: SATELLITE_LAYER_ID,
+                type: 'raster',
+                source: SATELLITE_SOURCE_ID,
+                layout: {
+                    visibility: isSatelliteMode ? 'visible' : 'none'
+                },
+                paint: {
+                    'raster-opacity': 1.0,
+                    'raster-fade-duration': 200
+                }
+            }, beforeLayerId);
+        } else {
+            map.setLayoutProperty(SATELLITE_LAYER_ID, 'visibility', isSatelliteMode ? 'visible' : 'none');
+        }
+    }
+
+    /**
+     * Injeksi Layer 3D Building Extrusions persis arsitektur C.O.R.E.
+     */
+    function inject3DBuildingsLayer() {
+        if (!map) return;
+        const layers = map.getStyle()?.layers || [];
+        const labelLayerId = layers.find(
+            (layer) => layer.type === 'symbol' && layer.layout && layer.layout['text-field']
+        )?.id;
+
+        if (!map.getLayer('3d-buildings')) {
+            map.addLayer({
+                'id': '3d-buildings',
+                'source': 'composite',
+                'source-layer': 'building',
+                'filter': ['==', 'extrude', 'true'],
+                'type': 'fill-extrusion',
+                'minzoom': 14,
+                'paint': {
+                    'fill-extrusion-color': '#d1d5db',
+                    'fill-extrusion-height': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        14,
+                        0,
+                        15.05,
+                        ['get', 'height']
+                    ],
+                    'fill-extrusion-base': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        14,
+                        0,
+                        15.05,
+                        ['get', 'min_height']
+                    ],
+                    'fill-extrusion-opacity': 0.65
+                },
+                'layout': {
+                    'visibility': (is3DMode && !isSatelliteMode) ? 'visible' : 'none'
+                }
+            }, labelLayerId);
+        } else {
+            map.setLayoutProperty('3d-buildings', 'visibility', (is3DMode && !isSatelliteMode) ? 'visible' : 'none');
+        }
+    }
+
+    function renderFallbackMapError(error) {
+        const el = document.getElementById('map') || mapElement;
+        if (!el) return;
+
+        const errMsg = (error && error.message) ? error.message : String(error || '');
+        const isWebGLError = errMsg.toLowerCase().includes('webgl') || errMsg.toLowerCase().includes('grafis');
+
+        const errorTitle = isWebGLError 
+            ? 'Akselerasi Grafis (WebGL) Terkendala' 
+            : 'Gagal Memuat Engine Peta 3D';
+            
+        const errorDesc = isWebGLError
+            ? 'Browser Anda kehabisan konteks grafis WebGL atau akselerasi hardware sedang nonaktif. Klik tombol "Muat Ulang Peta" di bawah untuk mencoba kembali.'
+            : (errMsg || 'Periksa token Mapbox atau koneksi internet perangkat Anda.');
+
+        el.innerHTML = `
+            <div class="flex flex-col items-center justify-center h-full w-full min-h-[400px] p-6 text-center bg-slate-50 border border-slate-200 rounded-2xl shadow-inner z-10">
+                <div class="w-16 h-16 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center mb-4 shadow-sm ring-8 ring-amber-50">
+                    <i class="fa-solid fa-triangle-exclamation text-2xl"></i>
+                </div>
+                <h3 class="text-base font-bold text-gray-800">${errorTitle}</h3>
+                <p class="text-xs text-gray-600 max-w-md mt-2 leading-relaxed">${errorDesc}</p>
+                <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
+                    <button 
+                        type="button" 
+                        onclick="if(window.USUClassMap && window.USUClassMap.retryInitMap) { window.USUClassMap.retryInitMap(); } else { location.reload(); }" 
+                        class="px-5 py-2.5 bg-[#10A760] text-white text-xs font-bold rounded-xl shadow-md hover:bg-[#0D8A4E] transition-all flex items-center gap-2 cursor-pointer active:scale-95"
+                    >
+                        <i class="fa-solid fa-rotate-right"></i>
+                        <span>Muat Ulang Peta</span>
+                    </button>
+                    <button 
+                        type="button" 
+                        onclick="location.reload()" 
+                        class="px-4 py-2.5 bg-white text-gray-700 border border-gray-300 text-xs font-semibold rounded-xl hover:bg-gray-50 transition-all cursor-pointer"
+                    >
+                        Refresh Halaman
+                    </button>
+                </div>
+                <div class="mt-4 text-[11px] text-gray-400 font-mono">
+                    Detail: ${errMsg || 'WebGL_Init_Failure'}
+                </div>
+            </div>
+        `;
+    }
+
+    // =========================================================================
+    // 3. RECENT SEARCHES (LOCALSTORAGE - MAX 5)
+    // =========================================================================
+    function getRecentSearches() {
+        try {
+            return JSON.parse(localStorage.getItem(RECENT_SEARCHES_KEY) || '[]');
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function saveRecentSearch(keyword) {
+        if (!keyword || typeof keyword !== 'string') return;
+        const cleanKw = keyword.trim();
+        if (cleanKw.length < 3) return;
+
+        let searches = getRecentSearches();
+
+        // Jika riwayat terakhir merupakan kelanjutan prefix atau sebaliknya, perbarui entri tersebut
+        if (searches.length > 0) {
+            const firstLower = searches[0].toLowerCase();
+            const cleanLower = cleanKw.toLowerCase();
+            if (cleanLower.startsWith(firstLower) || firstLower.startsWith(cleanLower)) {
+                searches[0] = cleanKw;
+                searches = searches.filter((s, idx) => idx === 0 || s.toLowerCase() !== cleanLower);
+                if (searches.length > 5) searches = searches.slice(0, 5);
+                localStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(searches));
+                renderRecentSearches();
+                return;
+            }
+        }
+
+        searches = searches.filter(s => s.toLowerCase() !== cleanKw.toLowerCase());
+        searches.unshift(cleanKw);
+
+        if (searches.length > 5) {
+            searches = searches.slice(0, 5);
+        }
+
+        localStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(searches));
+        renderRecentSearches();
+    }
+
+    function renderRecentSearches() {
+        if (!recentSearchesContainer) return;
+        const searches = getRecentSearches();
+
+        if (searches.length === 0) {
+            recentSearchesContainer.style.display = 'none';
+            recentSearchesContainer.innerHTML = '';
+            return;
+        }
+
+        recentSearchesContainer.style.display = 'block';
+        recentSearchesContainer.innerHTML = `
+            <div class="flex items-center justify-between mb-1.5">
+                <span class="text-[11px] font-bold text-gray-500 uppercase tracking-wider">Pencarian Terakhir:</span>
+                <button onclick="window.USUClassMap.clearAllRecentSearches()" class="text-[10px] text-gray-400 hover:text-red-500 transition-colors cursor-pointer">
+                    Hapus Semua
+                </button>
+            </div>
+            <div class="flex flex-wrap gap-1.5">
+                ${searches.map(s => `
+                    <button 
+                        type="button" 
+                        onclick="window.USUClassMap.applyRecentSearch('${s.replace(/'/g, "\\'")}')" 
+                        class="inline-flex items-center gap-1 px-2.5 py-1 text-xs bg-white hover:bg-green-50 text-gray-700 hover:text-[#10A760] border border-gray-200 hover:border-[#10A760] rounded-full shadow-2xs transition-all cursor-pointer"
+                    >
+                        <i class="fa-solid fa-magnifying-glass"></i>
+                        <span>${s}</span>
+                    </button>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    // =========================================================================
+    // 4. BOOKMARKS HELPER & STATE
+    // =========================================================================
+    function getBookmarks() {
+        try {
+            return JSON.parse(localStorage.getItem(BOOKMARKS_KEY) || '[]');
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function isScheduleBookmarked(scheduleId) {
+        const bookmarks = getBookmarks();
+        return bookmarks.some(b => b.id === scheduleId);
+    }
+
+    function toggleBookmark(schedule) {
+        try {
+            let bookmarks = getBookmarks();
+            const existsIndex = bookmarks.findIndex(b => b.id === schedule.id);
+
+            if (existsIndex > -1) {
+                bookmarks.splice(existsIndex, 1);
+                localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(bookmarks));
+                broadcastBookmarkUpdate(bookmarks.length);
+                return false;
+            } else {
+                bookmarks.push({
+                    id: schedule.id,
+                    namaMk: schedule.mata_kuliah?.nama || 'Mata Kuliah',
+                    kodeMk: schedule.mata_kuliah?.kode || '',
+                    dosen: schedule.dosen?.nama || 'Dosen Pengampu',
+                    hari: schedule.hari,
+                    jamMulai: schedule.jam_mulai,
+                    jamSelesai: schedule.jam_selesai,
+                    ruangan: schedule.ruangan?.nama || '',
+                    gedung: schedule.gedung?.nama || '',
+                    latitude: schedule.gedung?.latitude,
+                    longitude: schedule.gedung?.longitude,
+                });
+                localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(bookmarks));
+                broadcastBookmarkUpdate(bookmarks.length);
+                return true;
+            }
+        } catch (err) {
+            console.error('Failed to toggle bookmark:', err);
+            return false;
+        }
+    }
+
+    function broadcastBookmarkUpdate(count) {
+        window.dispatchEvent(new CustomEvent('usuclassmap:bookmarks-updated', {
+            detail: { count: count }
+        }));
+    }
+
+    // =========================================================================
+    // 5. CUSTOM MAPBOX MARKER DOM FACTORIES
+    // =========================================================================
+
+    /**
+     * Marker Gedung Normal (Hijau #10B981 saat buka / Merah #DC2626 saat tutup / Kuning #D4A017 saat hasil pencarian terbuka)
+     */
+    function createBuildingMarkerElement(label, isHighlighted = false, statusInfo = null) {
+        const el = document.createElement('div');
+        el.className = 'custom-mapbox-marker';
+        const status = statusInfo || evaluateBuildingWibStatus(null);
+        const isOpen = Boolean(status.is_open_now);
+        const markerColor = isOpen ? (isHighlighted ? '#D4A017' : '#10B981') : '#DC2626';
+        const ringHtml = isHighlighted
+            ? `<div class="absolute -inset-2 rounded-full ${isOpen ? 'bg-yellow-400' : 'bg-red-500'} opacity-50 animate-ping"></div>`
+            : '';
+
+        el.setAttribute('data-entity-type', 'building');
+        el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+        el.setAttribute('data-marker-color', markerColor);
+
+        el.innerHTML = `
+            <div class="relative flex flex-col items-center group cursor-pointer">
+                ${ringHtml}
+                <div class="relative">
+                    <div data-marker-circle="1" style="background-color: ${markerColor};" class="w-9 h-9 rounded-full shadow-lg flex items-center justify-center text-white border-2 border-white ${!isOpen ? 'ring-2 ring-red-200/80' : ''} transform transition-transform group-hover:scale-110">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path>
+                        </svg>
+                    </div>
+                    <span data-marker-closed-pill="1" style="background-color: #DC2626;" class="absolute -top-2 -right-2.5 text-white text-[9px] font-black px-1.5 py-0.5 rounded-full border border-white shadow-sm ${isOpen ? 'hidden' : ''}">Tutup</span>
+                </div>
+                <div class="mt-1 px-2 py-0.5 bg-gray-900/80 text-white text-[11px] font-semibold rounded shadow backdrop-blur-xs whitespace-nowrap">
+                    ${escapeHtmlSafe(label)}
+                </div>
+            </div>
+        `;
+        return el;
+    }
+
+    /**
+     * Marker Gedung Jadwal Saya (Oranye #EA580C saat buka / Merah #DC2626 saat tutup + Ring Kuning + Badge Bintang)
+     */
+    function createUserScheduleMarkerElement(label, myClassCount = 1, statusInfo = null) {
+        const el = document.createElement('div');
+        el.className = 'custom-mapbox-marker user-schedule-marker';
+        const status = statusInfo || evaluateBuildingWibStatus(null);
+        const isOpen = Boolean(status.is_open_now);
+        const markerColor = isOpen ? '#EA580C' : '#DC2626';
+
+        el.setAttribute('data-entity-type', 'building');
+        el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+        el.setAttribute('data-marker-color', markerColor);
+
+        el.innerHTML = `
+            <div class="relative flex flex-col items-center group cursor-pointer">
+                <div class="absolute -inset-2 rounded-full bg-yellow-400 opacity-60 animate-ping"></div>
+                
+                <div data-marker-circle="1" style="background-color: ${markerColor};" class="w-10 h-10 rounded-full shadow-xl flex items-center justify-center text-white border-2 border-white ring-2 ${!isOpen ? 'ring-red-200/80' : 'ring-yellow-400'} transform transition-transform group-hover:scale-115">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+                    </svg>
+                </div>
+
+                <div class="absolute -top-1.5 -right-1.5 bg-yellow-500 text-gray-900 text-[10px] font-black px-1.5 py-0.5 rounded-full border border-white shadow-sm flex items-center gap-0.5">
+                    <i class="fa-solid fa-star"></i><span>${myClassCount}</span>
+                </div>
+
+                <div class="mt-1 px-2 py-0.5 bg-orange-950/90 text-orange-200 text-[11px] font-bold rounded shadow border border-orange-500/40 backdrop-blur-xs whitespace-nowrap flex items-center gap-1">
+                    <i class="fa-solid fa-book-open"></i> <span>${escapeHtmlSafe(label)}</span>
+                    <span data-marker-closed-pill="1" style="background-color: #DC2626;" class="px-1 py-0.2 rounded text-[9px] font-black text-white ${isOpen ? 'hidden' : ''}">Tutup</span>
+                </div>
+            </div>
+        `;
+        return el;
+    }
+
+    /**
+     * Marker Mitra Fotokopi & Percetakan USU (Teal #0D9488 saat buka / Merah #DC2626 saat tutup + Kontras Border Putih)
+     */
+    function createPhotocopyMarkerElement(placeOrName, statusInfo = null) {
+        const placeObj = (typeof placeOrName === 'object' && placeOrName !== null)
+            ? placeOrName
+            : { name: String(placeOrName || 'Mitra Fotokopi') };
+        const name = String(placeObj.name || 'Mitra Fotokopi');
+        const status = statusInfo || evaluatePhotocopyWibStatus(placeObj);
+        const isOpen = Boolean(status.is_open_now);
+        const markerColor = status.marker_color || (isOpen ? '#0D9488' : '#DC2626');
+
+        const el = document.createElement('div');
+        el.className = 'custom-mapbox-marker photocopy-marker z-30';
+        el.style.display = 'block';
+        el.style.width = 'max-content';
+        el.style.height = 'auto';
+        el.style.zIndex = '30';
+        el.style.cursor = 'pointer';
+
+        el.setAttribute('data-entity-type', 'fotocopy');
+        if (placeObj.id) el.setAttribute('data-entity-id', String(placeObj.id));
+        el.setAttribute('data-open-status', isOpen ? 'open' : 'closed');
+        el.setAttribute('data-marker-color', markerColor);
+
+        const shortName = name.length > 20 ? name.substring(0, 18) + '...' : name;
+        const pillStyle = isOpen
+            ? 'background: linear-gradient(to right, #059669, #0D9488, #0891B2);'
+            : 'background: #DC2626;';
+
+        el.innerHTML = `
+            <div class="relative flex flex-col items-center group cursor-pointer" style="filter: drop-shadow(0 4px 6px rgba(0,0,0,0.28));">
+                <div data-marker-pill="1" style="${pillStyle}" class="px-2.5 py-1.5 text-white text-[11px] font-black rounded-lg border-2 border-white whitespace-nowrap flex items-center gap-1.5 transition-all transform group-hover:scale-105 shadow-md">
+                    <i class="fa-solid fa-print text-xs ${isOpen ? 'text-emerald-200' : 'text-red-100'}"></i>
+                    <span class="tracking-tight text-white">${escapeHtmlSafe(shortName)}</span>
+                    <span data-marker-closed-pill="1" class="px-1.5 py-0.5 rounded-full bg-red-950/60 text-white text-[9px] font-black ${isOpen ? 'hidden' : ''}">Tutup</span>
+                </div>
+                <div data-marker-tip="1" style="background-color: ${markerColor};" class="w-2.5 h-2.5 rotate-45 -mt-1 border-r-2 border-b-2 border-white shadow-2xs"></div>
+            </div>
+        `;
+        return el;
+    }
+
+    // =========================================================================
+    // 6. MULTIMEDIA DATA MOCKUP INJECTION
+    // =========================================================================
+    function getRoomMultimediaData(room, building) {
+        const roomName = room.name || 'Ruangan';
+        const doorUrl = room.door_photo || building.door_photo || room.photo_360 || building.photo_360 || '/images/stores/preset-modern-copy.webp';
+        const panoUrl = room.photo_360 || building.photo_360 || doorUrl;
+        const panoMeta = room.photo_360_meta || building.photo_360_meta || null;
+        const doorSource = panoMeta?.door_source || 'rectilinear_360';
+
+        return {
+            is_360: true,
+            media_type: '360',
+            thumbnail_url: doorUrl,
+            media_src: panoUrl,
+            photo_360_meta: panoMeta,
+            door_source: doorSource,
+            title: `Ruang ${roomName} — ${building.name || 'Gedung USU'}`
+        };
+    }
+
+    // =========================================================================
+    // 7. FETCH DATA (BUILDINGS & SCHEDULES)
+    // =========================================================================
+    async function fetchBuildings() {
+        try {
+            const response = await fetch('/api/buildings');
+            const result = await response.json();
+
+            if (window.__usuMapDestroyed || !map || typeof map.getCanvasContainer !== 'function' || !map.getCanvasContainer()) {
+                return;
+            }
+
+            if (result.status === 'success' && Array.isArray(result.data)) {
+                allBuildings = result.data;
+                renderBuildingMarkers(allBuildings);
+                if (!activeQuery && !activeDay) {
+                    renderDefaultSidebar();
+                    if (resultsCountEl) {
+                        resultsCountEl.textContent = `${allBuildings.length} Gedung`;
+                    }
+                    if (sourceBadgeEl) {
+                        sourceBadgeEl.textContent = 'Semua Gedung';
+                        sourceBadgeEl.className = 'px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800';
+                    }
+                }
+            }
+        } catch (error) {
+            if (!window.__usuMapDestroyed) {
+                console.error('Error fetching buildings:', error);
+            }
+        }
+    }
+
+    async function fetchUserSchedules() {
+        try {
+            const response = await fetch('/api/my-schedules', {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            });
+
+            if (!response.ok || window.__usuMapDestroyed) return;
+
+            const result = await response.json();
+
+            if (window.__usuMapDestroyed || !map || typeof map.getCanvasContainer !== 'function' || !map.getCanvasContainer()) {
+                return;
+            }
+
+            if (result.status === 'success' && Array.isArray(result.data) && result.data.length > 0) {
+                userSchedules = result.data;
+                currentUser = result.user;
+
+                userSchedulesByBuilding = {};
+                userSchedules.forEach(schedule => {
+                    const code = schedule.gedung?.kode || schedule.gedung?.nama;
+                    if (code) {
+                        if (!userSchedulesByBuilding[code]) {
+                            userSchedulesByBuilding[code] = [];
+                        }
+                        userSchedulesByBuilding[code].push(schedule);
+                    }
+                });
+
+                renderBuildingMarkers(allBuildings);
+                renderDefaultSidebar();
+            }
+        } catch (error) {
+            console.log('[USUClassMap] Info: Belum login atau jadwal saya tidak ditemukan.');
+        }
+    }
+
+    // =========================================================================
+    // 8. RENDER MARKERS & SMART POPUP (MAPBOX GL JS 3D)
+    // =========================================================================
+    function clearBuildingMarkers() {
+        Object.values(buildingMarkers).forEach(marker => marker.remove());
+        buildingMarkers = {};
+    }
+
+    function renderBuildingMarkers(buildings, highlightedBuildingIds = new Set()) {
+        if (window.__usuMapDestroyed || !map || typeof map.getCanvasContainer !== 'function' || !map.getCanvasContainer()) return;
+        clearBuildingMarkers();
+
+        const bounds = new mb.LngLatBounds();
+        let validPointsCount = 0;
+        const wib = getCurrentWibParts();
+
+        buildings.forEach(building => {
+            if (!building.latitude || !building.longitude) return;
+
+            const lng = parseFloat(building.longitude);
+            const lat = parseFloat(building.latitude);
+            if (isNaN(lng) || isNaN(lat)) return;
+
+            const isHighlighted = highlightedBuildingIds.has(building.id) || highlightedBuildingIds.has(building.code);
+            const schedulesForThisBuilding = userSchedulesByBuilding[building.code] || userSchedulesByBuilding[building.name] || [];
+            const myClassesInBuilding = schedulesForThisBuilding.filter(s => s.is_my_class === true);
+            const hasMyClasses = myClassesInBuilding.length > 0;
+            const opStatus = evaluateBuildingWibStatus(building, wib);
+
+            let markerEl;
+            if (hasMyClasses && !isHighlighted) {
+                markerEl = createUserScheduleMarkerElement(building.code || building.name, myClassesInBuilding.length, opStatus);
+            } else {
+                markerEl = createBuildingMarkerElement(building.code || building.name, isHighlighted, opStatus);
+            }
+            markerEl.setAttribute('data-entity-id', String(building.id));
+
+            const popupContent = generateBuildingPopupContent(
+                building, 
+                schedulesForThisBuilding, 
+                hasMyClasses
+            );
+
+            const popup = new mb.Popup({
+                maxWidth: '360px',
+                offset: [0, -42],
+                className: 'custom-popup usu-custom-popup',
+                closeButton: true,
+                closeOnClick: false,
+                focusAfterOpen: false
+            }).setHTML(popupContent);
+
+            const marker = new mb.Marker({ element: markerEl, anchor: 'bottom' })
+                .setLngLat([lng, lat])
+                .setPopup(popup)
+                .addTo(map);
+
+            marker._usuEntityType = 'building';
+            marker._usuEntityData = building;
+            marker._usuIsHighlighted = isHighlighted;
+            marker._usuHasMyClasses = hasMyClasses && !isHighlighted;
+            marker._usuPopupMeta = {
+                schedules: schedulesForThisBuilding,
+                isUserSchedule: hasMyClasses
+            };
+
+            buildingMarkers[building.id] = marker;
+            bounds.extend([lng, lat]);
+            validPointsCount++;
+        });
+
+        if (highlightedBuildingIds.size > 0 && validPointsCount > 0) {
+            const highlightBounds = new mb.LngLatBounds();
+            buildings
+                .filter(b => highlightedBuildingIds.has(b.id) || highlightedBuildingIds.has(b.code))
+                .forEach(b => highlightBounds.extend([parseFloat(b.longitude), parseFloat(b.latitude)]));
+
+            if (!highlightBounds.isEmpty()) {
+                map.fitBounds(highlightBounds, { padding: 60, maxZoom: 17, duration: 1200 });
+            }
+        }
+    }
+
+    /**
+     * GENERATE BUILDING POPUP CONTENT (SMART FOCUS & HIGHLIGHT INDEX 0)
+     * - Menempatkan ruangan target hasil pencarian di index 0 (paling atas).
+     * - Menyorot kartu ruangan target dengan border biru, ring menyala, dan lencana Hasil Pencarian.
+     * - Menempatkan jadwal target pilihan di urutan teratas (index 0) kartu ruangan.
+     * - Menampilkan kotak thumbnail foto kelas (w-20 h-20) di sisi kiri.
+     */
+    function generateBuildingPopupContent(
+        building, 
+        schedulesForBuilding = [], 
+        isUserSchedule = false, 
+        targetRoomId = null, 
+        targetRoomName = null, 
+        targetScheduleId = null, 
+        targetCourseCode = null, 
+        targetCourseName = null
+    ) {
+
+        // 1. Tentukan daftar ruangan
+        let roomsList = [];
+        if (building.rooms && Array.isArray(building.rooms) && building.rooms.length > 0) {
+            roomsList = [...building.rooms];
+        } else if (schedulesForBuilding.length > 0) {
+            const seen = new Set();
+            schedulesForBuilding.forEach(s => {
+                if (s.ruangan && !seen.has(s.ruangan.nama)) {
+                    seen.add(s.ruangan.nama);
+                    roomsList.push({
+                        id: s.ruangan.id || Math.floor(Math.random() * 1000),
+                        name: s.ruangan.nama,
+                        floor: s.ruangan.lantai || s.ruangan.floor || 1,
+                        photo_360: s.ruangan.foto_360 || building.photo_360 || null,
+                        door_photo: s.ruangan.foto_pintu || building.door_photo || null,
+                        photo_360_meta: building.photo_360_meta || null,
+                        schedules: []
+                    });
+                }
+            });
+        }
+
+        // Petakan jadwal ke nama ruangan
+        const schedulesByRoomName = {};
+        schedulesForBuilding.forEach(s => {
+            const rName = (s.ruangan?.nama || s.ruangan?.name || '').trim();
+            if (rName) {
+                if (!schedulesByRoomName[rName]) {
+                    schedulesByRoomName[rName] = [];
+                }
+                schedulesByRoomName[rName].push(s);
+            }
+        });
+
+        // Helper 1: Cek apakah ruangan cocok dengan target
+        const isRoomTarget = (room) => {
+            if (!targetRoomId && !targetRoomName) return false;
+            if (targetRoomId && (String(room.id) === String(targetRoomId))) return true;
+            if (targetRoomName && room.name) {
+                const cleanR = room.name.toLowerCase().replace(/\s+/g, '');
+                const cleanT = targetRoomName.toLowerCase().replace(/\s+/g, '');
+                return cleanR === cleanT || cleanR.includes(cleanT) || cleanT.includes(cleanR);
+            }
+            return false;
+        };
+
+        // Helper 2: Cek apakah jadwal cocok dengan target
+        const isScheduleTarget = (s) => {
+            if (!targetScheduleId && !targetCourseCode && !targetCourseName) return false;
+            if (targetScheduleId && String(s.id) === String(targetScheduleId)) return true;
+            
+            const sCode = (s.mata_kuliah?.kode || s.course_code || '').toLowerCase().trim();
+            if (targetCourseCode && sCode && sCode === targetCourseCode.toLowerCase().trim()) return true;
+
+            const sName = (s.mata_kuliah?.nama || s.course_name || '').toLowerCase().trim();
+            if (targetCourseName && sName) {
+                const cleanTarget = targetCourseName.toLowerCase().trim();
+                if (sName === cleanTarget || sName.includes(cleanTarget) || cleanTarget.includes(sName)) return true;
+            }
+
+            return false;
+        };
+
+        // SORTING RUANGAN: Pindahkan ruangan target ke index 0 (paling atas)
+        roomsList.sort((a, b) => {
+            const aTarget = isRoomTarget(a);
+            const bTarget = isRoomTarget(b);
+            if (aTarget && !bTarget) return -1;
+            if (!aTarget && bTarget) return 1;
+
+            const aSchedules = a.schedules || schedulesByRoomName[a.name] || [];
+            const bSchedules = b.schedules || schedulesByRoomName[b.name] || [];
+
+            const aHasTargetSchedule = aSchedules.some(s => isScheduleTarget(s));
+            const bHasTargetSchedule = bSchedules.some(s => isScheduleTarget(s));
+            if (aHasTargetSchedule && !bHasTargetSchedule) return -1;
+            if (!aHasTargetSchedule && bHasTargetSchedule) return 1;
+
+            const aHasMyClass = aSchedules.some(s => s.is_my_class);
+            const bHasMyClass = bSchedules.some(s => s.is_my_class);
+            if (aHasMyClass && !bHasMyClass) return -1;
+            if (!aHasMyClass && bHasMyClass) return 1;
+
+            return 0;
+        });
+
+        const myClassesInBuilding = schedulesForBuilding.filter(s => s.is_my_class === true);
+
+        // 2. Bangun kartu ruangan interaktif
+        let roomCardsHtml = '';
+        if (roomsList.length > 0) {
+            roomCardsHtml = roomsList.map(room => {
+                const isTarget = isRoomTarget(room);
+                const mediaData = getRoomMultimediaData(room, building);
+                
+                let roomSchedules = [];
+                if (room.schedules && Array.isArray(room.schedules) && room.schedules.length > 0) {
+                    roomSchedules = [...room.schedules];
+                } else if (schedulesByRoomName[room.name]) {
+                    roomSchedules = [...schedulesByRoomName[room.name]];
+                }
+
+                // SORTING JADWAL: Pindahkan jadwal target ke urutan pertama (Index 0)
+                roomSchedules.sort((a, b) => {
+                    const aIsTarget = isScheduleTarget(a);
+                    const bIsTarget = isScheduleTarget(b);
+                    if (aIsTarget && !bIsTarget) return -1;
+                    if (!aIsTarget && bIsTarget) return 1;
+
+                    if (a.is_my_class && !b.is_my_class) return -1;
+                    if (!a.is_my_class && b.is_my_class) return 1;
+
+                    return 0;
+                });
+
+                // Render list jadwal di ruangan
+                let schedulesHtml = '';
+                if (roomSchedules.length > 0) {
+                    schedulesHtml = `
+                        <div class="mt-1 space-y-1">
+                            ${roomSchedules.map(s => {
+                                const isTargetSchedule = isScheduleTarget(s);
+                                const mkName = s.mata_kuliah?.nama || s.course_name || 'Mata Kuliah';
+                                const timeRange = `${s.jam_mulai || s.time_start || '08:00'} - ${s.jam_selesai || s.time_end || '09:40'}`;
+                                const lecturerName = s.dosen?.nama || s.lecturer_name || 'Dosen Pengampu';
+                                const classGroup = s.kelompok_kelas || s.kelas || s.class_group || 'MKWU';
+
+                                if (isTargetSchedule) {
+                                    return `
+                                        <div class="bg-blue-100/90 border-l-4 border-blue-600 text-blue-950 p-2 rounded-r-md mb-1.5 shadow-xs font-bold text-[11px] ring-1 ring-blue-300 transition-all">
+                                            <div class="flex items-center justify-between gap-1">
+                                                <div class="flex items-center gap-1 truncate font-black text-blue-900">
+                                                    <i class="fa-solid fa-bullseye text-blue-600 shrink-0"></i>
+                                                    <span class="truncate">${mkName} (${timeRange})</span>
+                                                </div>
+                                                <span class="text-[9px] bg-blue-600 text-white font-extrabold px-1.5 py-0.5 rounded-full shrink-0 animate-pulse">
+                                                    Pilihan Anda
+                                                </span>
+                                            </div>
+                                            <div class="text-[10px] text-blue-800 font-medium truncate pl-4 mt-0.5">
+                                                ${lecturerName} • Kelas ${classGroup}
+                                            </div>
+                                        </div>
+                                    `;
+                                } else if (s.is_my_class === true) {
+                                    return `
+                                        <div class="bg-yellow-50 border border-yellow-400 text-yellow-900 p-1.5 rounded-md shadow-2xs text-[11px] font-semibold leading-tight">
+                                            <div class="flex items-center gap-1 truncate">
+                                                <i class="fa-solid fa-star text-amber-500 shrink-0"></i>
+                                                <span class="truncate">${mkName} (${timeRange})</span>
+                                            </div>
+                                            <div class="text-[10px] text-yellow-800/80 font-normal truncate pl-3 mt-0.5">
+                                                ${lecturerName} • Kelas ${classGroup}
+                                            </div>
+                                        </div>
+                                    `;
+                                } else {
+                                    return `
+                                        <div class="bg-gray-50 border border-gray-200 text-gray-600 p-1 rounded-md text-[11px] leading-tight">
+                                            <div class="flex items-center gap-1 truncate">
+                                                <span class="text-gray-400 shrink-0">•</span>
+                                                <span class="truncate font-medium text-gray-800">${mkName} (${timeRange})</span>
+                                            </div>
+                                            <div class="text-[10px] text-gray-400 truncate pl-2 mt-0.5">
+                                                ${lecturerName} • Kelas ${classGroup}
+                                            </div>
+                                        </div>
+                                    `;
+                                }
+                            }).join('')}
+                        </div>
+                    `;
+                } else {
+                    schedulesHtml = `
+                        <p class="text-gray-400 italic text-[10px] mt-1 flex items-center gap-1">
+                            <i class="fa-regular fa-circle"></i>
+                            <span>Tidak ada kelas saat ini</span>
+                        </p>
+                    `;
+                }
+
+                // Payload ruangan untuk modal multimedia
+                const roomPayload = {
+                    id: room.id,
+                    name: room.name,
+                    floor: room.floor || 1,
+                    capacity: room.capacity || 30,
+                    photo_url: mediaData.thumbnail_url,
+                    photo_360_url: mediaData.media_src,
+                    photo_360_meta: mediaData.photo_360_meta,
+                    door_source: mediaData.door_source,
+                    video_url: room.video_url || null,
+                    schedules: roomSchedules
+                };
+
+                const buildingPayload = {
+                    id: building.id,
+                    name: building.name,
+                    code: building.code,
+                    latitude: building.latitude,
+                    longitude: building.longitude
+                };
+
+                const roomJson = JSON.stringify(roomPayload).replace(/"/g, '&quot;');
+                const buildingJson = JSON.stringify(buildingPayload).replace(/"/g, '&quot;');
+
+                const cardClasses = isTarget
+                    ? 'flex gap-3 bg-blue-50/95 border-2 border-blue-500 shadow-md ring-4 ring-blue-100 p-2.5 rounded-xl mb-3 cursor-pointer transition-all target-room-highlight group relative'
+                    : 'flex gap-3 bg-white p-2 rounded-lg shadow-sm mb-3 border border-gray-100 hover:border-[#10A760] hover:bg-green-50/30 cursor-pointer transition-all group';
+
+                const targetBadgeHtml = isTarget
+                    ? `<span class="px-2 py-0.5 bg-blue-600 text-white font-extrabold text-[10px] rounded-full flex items-center gap-1 shadow-xs animate-pulse shrink-0">
+                           <i class="fa-solid fa-bullseye"></i>
+                           <span>Hasil Pencarian</span>
+                       </span>`
+                    : `<span class="text-[10px] font-bold text-[#10A760] group-hover:translate-x-0.5 transition-transform shrink-0 flex items-center gap-0.5">
+                           <span>Detail</span>
+                           <i class="fa-solid fa-arrow-right"></i>
+                       </span>`;
+
+                const guideTextHtml = isTarget
+                    ? `<p class="text-[10px] text-blue-700 font-bold flex items-center gap-1 mt-0.5">
+                           <i class="fa-solid fa-bullseye"></i>
+                           <span>Ruangan yang Anda cari — Klik untuk Detail</span>
+                       </p>`
+                    : `<p class="text-[10px] text-[#10A760] font-medium flex items-center gap-1 mt-0.5">
+                           <i class="fa-solid fa-wand-magic-sparkles"></i>
+                           <span>Klik untuk Detail & Multimedia</span>
+                       </p>`;
+
+                const safeRoomIdentifier = room.id || (room.name ? room.name.replace(/\s+/g, '_') : Math.floor(Math.random()*1000));
+
+                return `
+                    <div 
+                        id="room-card-${safeRoomIdentifier}"
+                        data-target-room="${isTarget ? 'true' : 'false'}"
+                        onclick="window.USUClassMap.openRoomDetailModal(${roomJson}, ${buildingJson})" 
+                        class="${cardClasses}"
+                        title="Klik untuk melihat foto besar, tur 360°, dan rute jalan"
+                    >
+                        <!-- Kiri: Visual Thumbnail Kelas (w-20 h-20) -->
+                        <div class="w-20 h-20 rounded-md overflow-hidden flex-shrink-0 bg-gray-100 relative shadow-2xs">
+                            <img 
+                                src="${mediaData.thumbnail_url}" 
+                                alt="${room.name}" 
+                                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                                loading="lazy"
+                            />
+                            <div class="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/60 via-transparent to-transparent p-1">
+                                <span class="text-[9px] font-bold text-white px-1 py-0.2 rounded bg-black/40 backdrop-blur-2xs">
+                                    Lt. ${room.floor || 1}
+                                </span>
+                            </div>
+                        </div>
+
+                        <!-- Kanan: Area Info & Jadwal -->
+                        <div class="flex-1 min-w-0 flex flex-col justify-center">
+                            <div class="flex items-center justify-between gap-1">
+                                <h5 class="font-bold text-xs ${isTarget ? 'text-blue-950 font-black' : 'text-gray-900'} group-hover:text-[#10A760] transition-colors truncate">
+                                    <i class="fa-solid fa-door-open"></i> Ruang ${room.name}
+                                </h5>
+                                ${targetBadgeHtml}
+                            </div>
+
+                            ${guideTextHtml}
+
+                            <div class="mt-1.5 flex items-center gap-1.5">
+                                <button
+                                    type="button"
+                                    onclick="event.stopPropagation(); window.USUClassMap.openRoomDetailModal(${roomJson}, ${buildingJson}, 'photo')"
+                                    class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-bold transition-colors cursor-pointer"
+                                >
+                                    <i class="fa-regular fa-image text-[9px]"></i>
+                                    <span>Foto Pintu</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onclick="event.stopPropagation(); window.USUClassMap.openRoomDetailModal(${roomJson}, ${buildingJson}, '360')"
+                                    class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 text-[10px] font-bold transition-colors cursor-pointer"
+                                >
+                                    <i class="fa-solid fa-rotate text-[9px]"></i>
+                                    <span>360°</span>
+                                </button>
+                            </div>
+
+                            <div class="mt-1">
+                                ${schedulesHtml}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        } else {
+            roomCardsHtml = `
+                <div class="text-center py-4 px-3 bg-white rounded-xl border border-gray-200">
+                    <p class="text-[11px] text-gray-500 font-medium">Gunakan tombol <strong class="text-emerald-700">Foto Pintu</strong> atau <strong class="text-sky-700">Lihat 360°</strong> di atas untuk pratinjau visual gedung ini.</p>
+                </div>
+            `;
+        }
+
+        // Header Highlights & Tags
+        const bStatus = evaluateBuildingWibStatus(building);
+        const bIsOpen = Boolean(bStatus.is_open_now);
+        const gpsDist = getDistanceInfoFromLastGps(building.latitude, building.longitude);
+        const badgeBg = bIsOpen
+            ? (myClassesInBuilding.length > 0 ? 'bg-orange-600' : 'bg-[#10A760]')
+            : 'bg-[#DC2626]';
+        const opBadgeHtml = bIsOpen
+            ? `<span class="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-bold rounded-full">${escapeHtmlSafe(bStatus.status_label)} • ${escapeHtmlSafe(bStatus.hours_label)}</span>`
+            : `<span class="px-2 py-0.5 bg-[#DC2626] text-white text-[10px] font-bold rounded-full"><i class="fa-solid fa-circle text-[7px] text-red-200 mr-1"></i>Tutup</span>`;
+        const opSubtextHtml = `<div class="mt-1 text-[10px] font-semibold ${bIsOpen ? 'text-emerald-700' : 'text-[#DC2626]'}">${escapeHtmlSafe(bStatus.detail_text)}</div>`;
+        const gpsDistHtml = gpsDist
+            ? `<div class="mt-0.5 text-[10px] font-bold text-sky-700 flex items-center gap-1"><i class="fa-solid fa-person-walking"></i><span>${gpsDist.label} (~${gpsDist.walkMinutes} mnt jalan kaki dari GPS Anda)</span></div>`
+            : '';
+
+        const userScheduleTag = myClassesInBuilding.length > 0 
+            ? `<span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 border border-yellow-300 text-[10px] font-extrabold rounded-full flex items-center gap-1 shadow-2xs">
+                   <i class="fa-solid fa-star"></i>
+                   <span>${myClassesInBuilding.length} Kelas Saya</span>
+               </span>` 
+            : '';
+
+        const fibWalkUrl = (() => {
+            const code = String(building.code || '').toUpperCase().trim();
+            const fac = String(building.faculty || '').toUpperCase().trim();
+            if (code === 'FIB') return '/virtual-walk/fib?scene=495';
+            if (code === 'FIB-O') return '/virtual-walk/fib?scene=430';
+            if (code === 'FIB-A' || code === 'A FIB') return '/virtual-walk/fib?scene=436';
+            if (code === 'FIB-B') return '/virtual-walk/fib?scene=439';
+            if (code === 'FIB-F') return '/virtual-walk/fib?scene=482';
+            if (code === 'FIB-H') return '/virtual-walk/fib?scene=456';
+            if (code === 'FIB-I') return '/virtual-walk/fib?scene=484';
+            if (code === 'FIB-K') return '/virtual-walk/fib?scene=474';
+            if (code === 'FIB-M') return '/virtual-walk/fib?scene=489';
+            if (code.startsWith('FIB') || fac === 'FIB') return '/virtual-walk/fib?scene=495';
+            return null;
+        })();
+
+        const fibWalkBtnHtml = fibWalkUrl
+            ? `<a href="${fibWalkUrl}" class="w-full mt-1.5 px-3 py-2 bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 font-bold text-xs rounded-lg shadow-2xs flex items-center justify-center gap-1.5 transition-colors">
+                   <i class="fa-solid fa-street-view text-amber-600"></i>
+                   <span>Jalan Virtual 360° FIB</span>
+               </a>`
+            : '';
+
+        const bldgDoorUrl = building.door_photo || building.photo_360 || '/images/stores/preset-modern-copy.webp';
+        const bldg360Url = building.photo_360 || bldgDoorUrl;
+        const bldgDoorSource = building.photo_360_meta?.door_source || 'rectilinear_360';
+        const bldgMediaRoomJson = JSON.stringify({
+            id: building.id,
+            name: building.name || building.code || 'Gedung',
+            floor: 1,
+            capacity: 40,
+            photo_url: bldgDoorUrl,
+            photo_360_url: bldg360Url,
+            photo_360_meta: building.photo_360_meta || null,
+            door_source: bldgDoorSource,
+            video_url: null,
+            schedules: schedulesForBuilding || []
+        }).replace(/"/g, '&quot;');
+        const bldgPayloadJson = JSON.stringify({
+            id: building.id,
+            name: building.name,
+            code: building.code,
+            latitude: building.latitude,
+            longitude: building.longitude
+        }).replace(/"/g, '&quot;');
+
+        const bldgMediaStripHtml = `
+            <div class="mt-2.5 p-2 rounded-xl bg-gray-50 border border-gray-200/90 flex items-center gap-2.5">
+                <img src="${bldgDoorUrl}" alt="${escapeHtmlSafe(building.name)}" class="w-14 h-11 rounded-lg object-cover border border-gray-200 bg-white shrink-0" />
+                <div class="flex-1 min-w-0 grid grid-cols-2 gap-1.5">
+                    <button type="button" data-open-door-modal="1" onclick="window.USUClassMap.openRoomDetailModal(${bldgMediaRoomJson}, ${bldgPayloadJson}, 'photo')" class="px-2 py-1.5 rounded-lg bg-white hover:bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold flex items-center justify-center gap-1 transition-colors cursor-pointer">
+                        <i class="fa-regular fa-image"></i>
+                        <span>Foto Pintu</span>
+                    </button>
+                    <button type="button" data-open-360-modal="1" onclick="window.USUClassMap.openRoomDetailModal(${bldgMediaRoomJson}, ${bldgPayloadJson}, '360')" class="px-2 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-[11px] font-bold flex items-center justify-center gap-1 transition-colors cursor-pointer">
+                        <i class="fa-solid fa-rotate"></i>
+                        <span>Lihat 360°</span>
+                    </button>
+                </div>
+            </div>
+        `;
+
+        return `
+            <div class="font-sans text-gray-800 overflow-hidden rounded-xl">
+                <!-- 1. STICKY HEADER -->
+                <div class="sticky top-0 bg-white z-10 border-b border-gray-200 p-3.5 relative shadow-2xs">
+                    <div class="flex items-center justify-between gap-2">
+                        <div class="flex items-center flex-wrap gap-1.5">
+                            <span class="inline-block px-2 py-0.5 ${badgeBg} text-white text-[10px] font-black rounded tracking-wide shadow-2xs">
+                                ${building.code || 'GEDUNG'}
+                            </span>
+                            ${opBadgeHtml}
+                            ${userScheduleTag}
+                        </div>
+                        <span class="text-[10px] text-gray-400 font-medium shrink-0">${roomsList.length} Ruangan</span>
+                    </div>
+
+                    <h4 class="font-black text-sm text-gray-900 mt-1.5 leading-tight">${building.name}</h4>
+                    <p class="text-[11px] text-gray-500 line-clamp-1 mt-0.5">${building.description || 'Fakultas / Fasilitas Kampus Universitas Sumatera Utara'}</p>
+                    ${opSubtextHtml}
+                    ${gpsDistHtml}
+                    ${bldgMediaStripHtml}
+
+                    <!-- Tombol Petunjuk Arah In-App -->
+                    <button type="button" onclick="window.USUClassMap && window.USUClassMap.startRouteTo('building:${building.id}')" class="w-full mt-2.5 px-3 py-2 bg-[#10A760] hover:bg-[#0D8A4E] text-white font-bold text-xs rounded-lg shadow-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer">
+                        <i class="fa-solid fa-route"></i>
+                        <span>Arahkan Rute ke Gedung Ini</span>
+                    </button>
+                    ${fibWalkBtnHtml}
+                </div>
+
+                <!-- 2. SCROLLABLE BODY (VISUAL SMART ROOM CARDS) -->
+                <div class="max-h-[260px] overflow-y-auto p-2.5 bg-gray-50 custom-scrollbar">
+                    <div class="text-[10px] font-extrabold text-gray-500 uppercase tracking-wider mb-2 px-1 flex items-center justify-between">
+                        <span>Daftar Ruangan & Jadwal</span>
+                        <span class="text-[9px] text-[#10A760] font-semibold">Klik kartu untuk tur</span>
+                    </div>
+                    ${roomCardsHtml}
+                </div>
+            </div>
+        `;
+    }
+
+    // =========================================================================
+    // 9. SEARCH & FILTER SCHEDULES (SPARQL & SEMANTIC + SMART SEARCH LAYER)
+    // =========================================================================
+    function escapeHtmlSafe(str) {
+        return String(str ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function looksLikeSmartSearchQuery(query) {
+        if (!query) return false;
+        const spatialPattern = /\b(depan|seberang|sebrang|samping|sebelah|belakang|balik|antara|ingatnya|ingetnya|lupa\s+nama|patokan|fakultas\s+[a-z0-9]{1,2}|gedung\s+[a-z0-9]{1,2})\b/i;
+        const photocopyPattern = /\b(pulpen|pena|bolpen|bulpen|polpen|pensil|kertas|hvs|print|ngeprint|cetak|fotocopy|fotokopi|potokopi|jilid|hardcover|softcover|spiral|spidol|stabilo|highlighter|binder|stopmap|stofmap|materai|meterai|laminating|scan|stapler|lakban|atk|murah|termurah|di\s+bawah|tipec|tipex|tipe-x|tip-x|stipo|correction|sticky|usupress|usu\s*press|penerbit)\b/i;
+        return spatialPattern.test(query) || photocopyPattern.test(query);
+    }
+
+    function getAvailableGpsCoords() {
+        if (lastGpsFix && Number.isFinite(Number(lastGpsFix.lat)) && Number.isFinite(Number(lastGpsFix.lng))) {
+            return { lat: Number(lastGpsFix.lat), lng: Number(lastGpsFix.lng) };
+        }
+        const cached = readCachedGpsFromStorage();
+        if (cached) {
+            return { lat: cached.lat, lng: cached.lng };
+        }
+        return null;
+    }
+
+    async function runMapSmartSearch(query, day) {
+        try {
+            const url = new URL('/api/smart-search', window.location.origin);
+            url.searchParams.set('q', query);
+            if (day) url.searchParams.set('day', day);
+            const gps = getAvailableGpsCoords();
+            if (gps) {
+                url.searchParams.set('lat', String(gps.lat));
+                url.searchParams.set('lng', String(gps.lng));
+            }
+
+            const resp = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+            if (!resp.ok) return false;
+            const smart = await resp.json();
+
+            if (smart.intent === 'smart_fotocopy_search' && smart.fotocopy?.results?.length > 0) {
+                if (resultsCountEl) resultsCountEl.textContent = `${smart.fotocopy.count} Produk/Jasa Fotokopi`;
+                if (sourceBadgeEl) {
+                    sourceBadgeEl.textContent = 'Smart Fotokopi';
+                    sourceBadgeEl.className = 'px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800';
+                }
+                renderSmartFotocopySidebar(smart.fotocopy);
+                highlightSmartFotocopyOnMap(smart.fotocopy);
+                return true;
+            }
+
+            if (smart.spatial?.candidates?.length > 0) {
+                if (resultsCountEl) resultsCountEl.textContent = `${smart.spatial.count} Kandidat Gedung`;
+                if (sourceBadgeEl) {
+                    sourceBadgeEl.textContent = 'Tebak Spasial';
+                    sourceBadgeEl.className = 'px-2 py-0.5 text-[10px] font-bold rounded bg-amber-100 text-amber-800';
+                }
+                const candidateCodes = new Set();
+                smart.spatial.candidates.forEach(c => {
+                    if (c.code) candidateCodes.add(c.code);
+                    if (c.name) candidateCodes.add(c.name);
+                });
+                renderSearchMarkers(allBuildings, candidateCodes, {});
+                renderSmartSpatialSidebar(smart.spatial);
+                return true;
+            }
+
+            if (smart.fotocopy?.results?.length > 0) {
+                if (resultsCountEl) resultsCountEl.textContent = `${smart.fotocopy.count} Produk/Jasa Fotokopi`;
+                if (sourceBadgeEl) {
+                    sourceBadgeEl.textContent = 'Smart Fotokopi';
+                    sourceBadgeEl.className = 'px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800';
+                }
+                renderSmartFotocopySidebar(smart.fotocopy);
+                highlightSmartFotocopyOnMap(smart.fotocopy);
+                return true;
+            }
+        } catch (err) {
+            console.warn('[USUClassMap] Smart search error:', err);
+        }
+        return false;
+    }
+
+    async function highlightSmartFotocopyOnMap(fotocopyData) {
+        try {
+            const storeIds = new Set((fotocopyData.results || []).map(r => Number(r.store?.id)).filter(Boolean));
+            const places = await loadPhotocopyPlaces();
+            const matchedPlaces = places.filter(p => storeIds.has(Number(p.id)));
+            if (matchedPlaces.length > 0) {
+                renderPhotocopyMarkers(matchedPlaces);
+                if (map) {
+                    const bounds = new mb.LngLatBounds();
+                    matchedPlaces.forEach(p => {
+                        const lat = parseFloat(p.location?.latitude ?? p.latitude);
+                        const lng = parseFloat(p.location?.longitude ?? p.longitude);
+                        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+                            bounds.extend(toMapboxCoord(lat, lng));
+                        }
+                    });
+                    if (!bounds.isEmpty()) {
+                        map.fitBounds(bounds, { padding: 70, maxZoom: 16.5, duration: 1000 });
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    function renderSmartSpatialSidebar(spatialData) {
+        if (!searchResultsContainer) return;
+        const candidates = spatialData.candidates || [];
+        const advisoryHtml = spatialData.advisory_note
+            ? `<div class="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 mb-3">${escapeHtmlSafe(spatialData.advisory_note)}</div>`
+            : '';
+
+        searchResultsContainer.innerHTML = `
+            <div class="space-y-3">
+                ${advisoryHtml}
+                <div class="text-[11px] font-bold text-gray-500 uppercase tracking-wider">Tebakan Gedung Kampus USU:</div>
+                ${candidates.map((c, idx) => {
+                    const op = c.operational_status || evaluateBuildingWibStatus(c);
+                    const isOpen = Boolean(op.is_open_now);
+                    const statusBadge = isOpen
+                        ? `<span class="px-1.5 py-0.5 bg-emerald-100 text-emerald-800 rounded text-[9px] font-bold">Buka</span>`
+                        : `<span class="px-1.5 py-0.5 bg-[#DC2626] text-white rounded text-[9px] font-bold">Tutup</span>`;
+                    return `
+                    <div class="p-3.5 bg-white border ${idx === 0 ? 'border-[#10A760] ring-1 ring-emerald-200' : 'border-gray-200'} rounded-xl shadow-xs space-y-2">
+                        <div class="flex items-start justify-between gap-2">
+                            <div>
+                                <div class="text-xs font-extrabold text-gray-900">${escapeHtmlSafe(c.name)} (${escapeHtmlSafe(c.code)})</div>
+                                <div class="text-[11px] text-gray-500 flex items-center gap-1.5 mt-0.5">
+                                    <span>${escapeHtmlSafe(c.faculty)}</span>
+                                    ${statusBadge}
+                                </div>
+                            </div>
+                            <span class="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded-full text-[10px] font-black shrink-0">${c.confidence_percent}% cocok</span>
+                        </div>
+                        <p class="text-xs text-gray-700 leading-relaxed">${escapeHtmlSafe(c.spatial_reason)}</p>
+                        <div class="flex items-center gap-2 pt-1">
+                            <button type="button" onclick="window.USUClassMap && window.USUClassMap.focusBuilding(${Number(c.building_id)})" class="flex-1 py-1.5 px-2.5 bg-emerald-50 hover:bg-[#10A760] text-[#10A760] hover:text-white text-xs font-bold rounded-lg transition-colors cursor-pointer">
+                                <i class="fa-solid fa-location-dot"></i> Lihat di Peta
+                            </button>
+                            <button type="button" onclick="window.USUClassMap && window.USUClassMap.startRouteTo('building:${Number(c.building_id)}')" class="py-1.5 px-3 bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-800 text-xs font-bold rounded-lg transition-colors cursor-pointer">
+                                <i class="fa-solid fa-route"></i> Rute GPS
+                            </button>
+                        </div>
+                    </div>
+                `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderSmartFotocopySidebar(fotocopyData) {
+        if (!searchResultsContainer) return;
+        const items = fotocopyData.results || [];
+        const advisoryHtml = fotocopyData.advisory_note
+            ? `<div class="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 mb-3">${escapeHtmlSafe(fotocopyData.advisory_note)}</div>`
+            : '';
+
+        searchResultsContainer.innerHTML = `
+            <div class="space-y-3">
+                ${advisoryHtml}
+                <div class="text-[11px] font-bold text-gray-500 uppercase tracking-wider">Anchor: ${escapeHtmlSafe(fotocopyData.anchor?.label || 'Kampus USU')}</div>
+                ${items.map(it => {
+                    const imgHtml = it.image_url
+                        ? `<img src="${escapeHtmlSafe(it.image_url)}" alt="${escapeHtmlSafe(it.name)}" class="w-12 h-12 rounded-lg object-cover border border-gray-200 shrink-0 bg-white">`
+                        : `<div class="w-12 h-12 rounded-lg bg-emerald-50 text-[#10A760] flex items-center justify-center shrink-0"><i class="fa-solid fa-print"></i></div>`;
+                    const badgeClass = it.exact_attribute_match ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800';
+                    const badgeLabel = it.exact_attribute_match ? escapeHtmlSafe(it.category) : 'Alternatif';
+                    const isOpenNow = Boolean(it.store?.operational_status?.is_open_now ?? it.store?.is_open_now);
+                    const openClass = isOpenNow ? 'text-emerald-700 font-bold' : 'text-[#DC2626] font-bold';
+                    const openText = isOpenNow ? 'Buka' : 'Tutup';
+                    const storeId = Number(it.store?.id || 0);
+                    return `
+                        <div class="p-3.5 bg-white border border-gray-200 hover:border-[#10A760] rounded-xl shadow-xs space-y-2">
+                            <div class="flex items-start gap-2.5">
+                                ${imgHtml}
+                                <div class="flex-1 min-w-0">
+                                    <div class="flex items-start justify-between gap-1.5">
+                                        <h4 class="font-bold text-xs text-gray-900 leading-snug line-clamp-2">${escapeHtmlSafe(it.name)}</h4>
+                                        <span class="px-1.5 py-0.5 rounded text-[9px] font-extrabold shrink-0 ${badgeClass}">${badgeLabel}</span>
+                                    </div>
+                                    <div class="mt-1 text-xs font-black text-[#10A760]">${escapeHtmlSafe(it.formatted_price)} / ${escapeHtmlSafe(it.unit)}</div>
+                                    <div class="text-[11px] font-semibold text-gray-700 truncate">${escapeHtmlSafe(it.store?.name || '')}</div>
+                                    <div class="text-[10px] text-gray-500">~${Number(it.store?.distance_meters || 0)} m (${Number(it.store?.walk_minutes || 1)} mnt) • <span class="${openClass}">${openText}</span></div>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2 pt-1">
+                                <a href="${escapeHtmlSafe(it.actions?.order_url || `/fotocopy/${storeId}/order`)}" class="flex-1 py-1.5 px-2.5 bg-[#10A760] hover:bg-[#0D8A4E] text-white text-xs font-bold rounded-lg text-center transition-colors">
+                                    Pesan di Toko
+                                </a>
+                                <button type="button" onclick="window.USUClassMap && window.USUClassMap.startRouteTo('fotocopy:${storeId}')" class="py-1.5 px-3 bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-800 text-xs font-bold rounded-lg transition-colors cursor-pointer">
+                                    <i class="fa-solid fa-route"></i> Rute
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    async function searchSchedules() {
+        const query = activeQuery.trim();
+        const day = activeDay.trim();
+
+        if (searchResultsContainer) {
+            searchResultsContainer.innerHTML = `
+                <div class="flex flex-col items-center justify-center py-12 text-gray-400">
+                    <svg class="animate-spin h-8 w-8 text-[#10A760] mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                    </svg>
+                    <span class="text-xs font-semibold text-gray-600">Mencari via SPARQL & Smart Search...</span>
+                </div>
+            `;
+        }
+
+        if (!query && !day) {
+            currentSchedules = [];
+            renderBuildingMarkers(allBuildings);
+            renderDefaultSidebar();
+            if (resultsCountEl) resultsCountEl.textContent = `${allBuildings.length} Gedung`;
+            if (sourceBadgeEl) {
+                sourceBadgeEl.textContent = 'Semua Gedung';
+                sourceBadgeEl.className = 'px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800';
+            }
+            return;
+        }
+
+        if (query && looksLikeSmartSearchQuery(query)) {
+            const handled = await runMapSmartSearch(query, day);
+            if (handled) return;
+        }
+
+        try {
+            const url = new URL('/api/schedules/search', window.location.origin);
+            if (query) url.searchParams.set('q', query);
+            if (day) url.searchParams.set('day', day);
+
+            const response = await fetch(url.toString());
+            const result = await response.json();
+
+            if (result.status === 'success') {
+                currentSchedules = result.data || [];
+
+                if (currentSchedules.length === 0 && query.length >= 3) {
+                    const handledFallback = await runMapSmartSearch(query, day);
+                    if (handledFallback) return;
+                }
+
+                if (resultsCountEl) resultsCountEl.textContent = `${currentSchedules.length} Jadwal`;
+                if (sourceBadgeEl) {
+                    sourceBadgeEl.textContent = result.source || 'SPARQL';
+                    sourceBadgeEl.className = result.source?.includes('SPARQL')
+                        ? 'px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800'
+                        : 'px-2 py-0.5 text-[10px] font-bold rounded bg-blue-100 text-blue-800';
+                }
+
+                const highlightedBuildingCodes = new Set();
+                const schedulesByBuilding = {};
+
+                currentSchedules.forEach(schedule => {
+                    const buildingCode = schedule.gedung?.kode || schedule.gedung?.nama;
+                    if (buildingCode) {
+                        highlightedBuildingCodes.add(buildingCode);
+                        if (!schedulesByBuilding[buildingCode]) {
+                            schedulesByBuilding[buildingCode] = [];
+                        }
+                        schedulesByBuilding[buildingCode].push(schedule);
+                    }
+                });
+
+                renderSearchMarkers(allBuildings, highlightedBuildingCodes, schedulesByBuilding);
+                renderSidebarResults(currentSchedules);
+            }
+        } catch (error) {
+            console.error('Error searching schedules:', error);
+            if (searchResultsContainer) {
+                searchResultsContainer.innerHTML = `
+                    <div class="p-4 bg-red-50 text-red-600 rounded-xl text-xs text-center border border-red-200">
+                        Terjadi kesalahan saat memuat data jadwal. Silakan coba kembali.
+                    </div>
+                `;
+            }
+        }
+    }
+
+    function renderSearchMarkers(buildings, highlightedCodes, schedulesByBuilding) {
+        if (!map) return;
+        clearBuildingMarkers();
+
+        const highlightBounds = new mb.LngLatBounds();
+        let matchedCount = 0;
+        const wib = getCurrentWibParts();
+
+        buildings.forEach(building => {
+            if (!building.latitude || !building.longitude) return;
+
+            const lng = parseFloat(building.longitude);
+            const lat = parseFloat(building.latitude);
+            if (isNaN(lng) || isNaN(lat)) return;
+
+            const isMatched = highlightedCodes.has(building.code) || highlightedCodes.has(building.name);
+            const schedules = isMatched ? (schedulesByBuilding[building.code] || schedulesByBuilding[building.name] || []) : [];
+            const opStatus = evaluateBuildingWibStatus(building, wib);
+
+            const markerEl = createBuildingMarkerElement(building.code || building.name, isMatched, opStatus);
+            markerEl.setAttribute('data-entity-id', String(building.id));
+            if (!isMatched) {
+                markerEl.style.opacity = '0.4';
+            }
+
+            const popupContent = generateBuildingPopupContent(building, schedules, false);
+            const popup = new mb.Popup({
+                maxWidth: '360px',
+                offset: [0, -42],
+                className: 'custom-popup usu-custom-popup',
+                closeButton: true,
+                closeOnClick: false,
+                focusAfterOpen: false
+            }).setHTML(popupContent);
+
+            const marker = new mb.Marker({ element: markerEl, anchor: 'bottom' })
+                .setLngLat([lng, lat])
+                .setPopup(popup)
+                .addTo(map);
+
+            marker._usuEntityType = 'building';
+            marker._usuEntityData = building;
+            marker._usuIsHighlighted = isMatched;
+            marker._usuHasMyClasses = false;
+            marker._usuPopupMeta = {
+                schedules,
+                isUserSchedule: false
+            };
+
+            buildingMarkers[building.id] = marker;
+
+            if (isMatched) {
+                highlightBounds.extend([lng, lat]);
+                matchedCount++;
+            }
+        });
+
+        if (matchedCount > 0 && !highlightBounds.isEmpty()) {
+            map.fitBounds(highlightBounds, { padding: 60, maxZoom: 17, duration: 1200 });
+        }
+    }
+
+    // =========================================================================
+    // 10. SIDEBAR RENDERING WITH SMART FOCUS TRIGGER
+    // =========================================================================
+    function renderDefaultSidebar() {
+        if (!searchResultsContainer) return;
+
+        let userBannerHtml = '';
+        if (currentUser && userSchedules.length > 0) {
+            const myClassesTotal = userSchedules.filter(s => s.is_my_class === true).length;
+            const buildingCount = Object.keys(userSchedulesByBuilding).length;
+            
+            userBannerHtml = `
+                <div class="p-3.5 bg-gradient-to-r from-amber-500 to-orange-600 rounded-xl text-white shadow-md mb-3 border border-yellow-400">
+                    <div class="flex items-start justify-between gap-2">
+                        <div>
+                            <div class="flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-yellow-100">
+                                <i class="fa-solid fa-star"></i>
+                                <span>Jadwal Mahasiswa Terdaftar</span>
+                            </div>
+                            <h4 class="font-bold text-sm text-white mt-0.5">${currentUser.name || 'Mahasiswa'}</h4>
+                            <p class="text-[11px] text-yellow-100 mt-0.5">
+                                ${myClassesTotal} Kelas Anda • ${buildingCount} Gedung Kuliah
+                            </p>
+                        </div>
+                        <button 
+                            onclick="window.USUClassMap.focusUserSchedules()" 
+                            class="px-2.5 py-1.5 bg-white text-orange-700 hover:bg-yellow-50 font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer"
+                            title="Tampilkan semua gedung kelas Anda"
+                        >
+                            Fokus <i class="fa-solid fa-bullseye"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        const defaultWib = getCurrentWibParts();
+        searchResultsContainer.innerHTML = `
+            <div class="space-y-2.5">
+                ${userBannerHtml}
+                <div class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Gedung Kampus USU:</div>
+                ${allBuildings.map(b => {
+                    const buildingSchedules = userSchedulesByBuilding[b.code] || userSchedulesByBuilding[b.name] || [];
+                    const myClasses = buildingSchedules.filter(s => s.is_my_class === true);
+                    const hasMyClass = myClasses.length > 0;
+                    const op = evaluateBuildingWibStatus(b, defaultWib);
+                    const isOpen = Boolean(op.is_open_now);
+                    const gpsDist = getDistanceInfoFromLastGps(b.latitude, b.longitude);
+
+                    const classBadge = hasMyClass 
+                        ? `<span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 border border-yellow-300 font-bold text-[10px] rounded-full"><i class="fa-solid fa-star"></i> ${myClasses.length} Kelas Saya</span>` 
+                        : '';
+                    const statusBadgeClass = isOpen
+                        ? 'px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800'
+                        : 'px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#DC2626] text-white';
+                    return `
+                        <div onclick="window.USUClassMap.focusBuilding(${b.id})" class="p-3.5 bg-white hover:bg-green-50/60 border ${hasMyClass ? 'border-yellow-400 bg-yellow-50/30' : 'border-gray-200'} hover:border-[#10A760] rounded-xl shadow-xs cursor-pointer transition-all duration-150 group">
+                            <div class="flex items-center justify-between gap-2">
+                                <div class="flex items-center flex-wrap gap-1.5">
+                                    <span class="text-xs font-bold px-2 py-0.5 ${hasMyClass ? 'bg-orange-600 text-white' : 'bg-gray-100 text-gray-800'} rounded-md group-hover:bg-[#10A760] group-hover:text-white transition-colors">
+                                        ${escapeHtmlSafe(b.code)}
+                                    </span>
+                                    <span data-sidebar-building-status="1" data-open-status="${isOpen ? 'open' : 'closed'}" class="${statusBadgeClass}">${isOpen ? 'Buka' : 'Tutup'}</span>
+                                    ${classBadge}
+                                </div>
+                                <span class="text-[11px] text-gray-400 font-medium shrink-0">${b.rooms_count || b.rooms?.length || 0} Ruangan</span>
+                            </div>
+                            <h4 class="font-bold text-sm text-gray-900 mt-2">${escapeHtmlSafe(b.name)}</h4>
+                            <p class="text-xs text-gray-500 line-clamp-1 mt-0.5">${escapeHtmlSafe(b.description || 'Gedung perkuliahan')}</p>
+                            <div data-sidebar-building-distance="1" data-lat="${b.latitude}" data-lng="${b.longitude}" class="mt-1 text-[10px] font-semibold text-sky-700 ${gpsDist ? '' : 'hidden'}">${gpsDist ? `${gpsDist.label} (~${gpsDist.walkMinutes} mnt)` : ''}</div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderSidebarResults(schedules) {
+        if (!searchResultsContainer) return;
+
+        if (schedules.length === 0) {
+            searchResultsContainer.innerHTML = `
+                <div class="text-center py-10 px-4 bg-white rounded-2xl border border-dashed border-gray-300 shadow-2xs">
+                    <div class="w-12 h-12 rounded-full bg-amber-50 text-amber-500 mx-auto flex items-center justify-center mb-3">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                    </div>
+                    <h4 class="text-sm font-bold text-gray-900">Jadwal Tidak Ditemukan</h4>
+                    <p class="mt-1 text-xs text-gray-500 leading-relaxed max-w-xs mx-auto">
+                        Tidak ada jadwal yang cocok dengan kata kunci atau filter hari yang Anda pilih.
+                    </p>
+                    <button 
+                        type="button" 
+                        onclick="window.USUClassMap.resetFilters()" 
+                        class="mt-4 px-4 py-2 bg-gray-100 hover:bg-[#10A760] text-gray-700 hover:text-white text-xs font-bold rounded-lg transition-colors cursor-pointer"
+                    >
+                        Reset Pencarian & Filter
+                    </button>
+                </div>
+            `;
+            return;
+        }
+
+        searchResultsContainer.innerHTML = `
+            <div class="space-y-3">
+                ${schedules.map(s => {
+                    const isBookmarked = isScheduleBookmarked(s.id);
+                    const isMyClass = s.is_my_class === true;
+
+                    const safeGedungNama = (s.gedung?.nama || '').replace(/'/g, "\\'");
+                    const safeRuanganNama = (s.ruangan?.nama || '').replace(/'/g, "\\'");
+                    const safeKodeMk = (s.mata_kuliah?.kode || '').replace(/'/g, "\\'");
+                    const safeNamaMk = (s.mata_kuliah?.nama || '').replace(/'/g, "\\'");
+                    const ruanganId = s.ruangan?.id || 'null';
+                    const gedungId = s.gedung?.id || 'null';
+                    const scheduleId = s.id || 'null';
+
+                    return `
+                        <div class="p-4 bg-white border ${isMyClass ? 'border-yellow-400 bg-yellow-50/20' : 'border-gray-200'} hover:border-[#10A760] rounded-xl shadow-xs hover:shadow-md transition-all duration-150">
+                            <div class="flex items-start justify-between gap-2">
+                                <div>
+                                    <div class="flex items-center gap-1.5">
+                                        <span class="inline-block px-2 py-0.5 text-[10px] font-bold rounded ${s.mata_kuliah.tipe === 'MKWU' ? 'bg-purple-100 text-purple-700' : 'bg-emerald-100 text-emerald-800'}">
+                                            ${s.mata_kuliah.tipe || 'MKWK'} • ${s.mata_kuliah.sks} SKS
+                                        </span>
+                                        ${isMyClass ? '<span class="px-1.5 py-0.5 bg-yellow-100 text-yellow-800 font-bold text-[9px] rounded"><i class="fa-solid fa-star"></i> Kelas Saya</span>' : ''}
+                                    </div>
+                                    <h4 class="font-bold text-sm text-gray-900 mt-1">${s.mata_kuliah.nama}</h4>
+                                    <span class="text-[11px] text-gray-500 font-mono">${s.mata_kuliah.kode} • Kelas ${s.kelompok_kelas || s.kelas || 'A'}</span>
+                                </div>
+                                <button 
+                                    onclick="window.USUClassMap.handleBookmarkToggle(${JSON.stringify(s).replace(/"/g, '&quot;')}, this)" 
+                                    title="${isBookmarked ? 'Hapus Bookmark' : 'Simpan Bookmark'}" 
+                                    class="p-1.5 rounded-full hover:bg-green-50 transition-colors cursor-pointer ${isBookmarked ? 'text-[#D4A017]' : 'text-gray-300 hover:text-[#10A760]'}"
+                                >
+                                    <svg class="w-5 h-5 fill-current" viewBox="0 0 24 24">
+                                        <path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"></path>
+                                    </svg>
+                                </button>
+                            </div>
+
+                            <div class="mt-2.5 text-xs text-gray-600 flex items-center gap-1.5">
+                                <i class="fa-solid fa-chalkboard-user"></i>
+                                <span class="font-medium truncate text-gray-800">${s.dosen.nama}</span>
+                            </div>
+
+                            <div class="mt-2 pt-2 border-t border-gray-100 flex items-center justify-between text-xs text-gray-500">
+                                <span class="font-bold text-gray-700"><i class="fa-solid fa-calendar-days"></i> ${s.hari}, ${s.jam_mulai}-${s.jam_selesai}</span>
+                                <span class="font-bold text-emerald-700"><i class="fa-solid fa-landmark"></i> ${s.gedung.nama} (${s.ruangan.nama})</span>
+                            </div>
+
+                            <!-- Tombol 'Lihat di Peta' dengan Parameter Smart Focus Lengkap -->
+                            <div class="mt-3 flex items-center gap-2">
+                                <button 
+                                    onclick="window.USUClassMap.focusBuildingWithTarget(${gedungId}, '${safeGedungNama}', ${s.gedung.latitude}, ${s.gedung.longitude}, ${ruanganId}, '${safeRuanganNama}', ${scheduleId}, '${safeKodeMk}', '${safeNamaMk}')" 
+                                    class="flex-1 py-2 px-2.5 bg-green-50 hover:bg-[#10A760] text-[#10A760] hover:text-white text-xs font-bold rounded-lg text-center transition-colors cursor-pointer flex items-center justify-center gap-1.5 group"
+                                >
+                                    <i class="fa-solid fa-location-dot"></i>
+                                    <span>Lihat di Peta</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onclick="window.USUClassMap && window.USUClassMap.startRouteTo('${gedungId ? `building:${gedungId}` : `${s.gedung.latitude},${s.gedung.longitude}`}')"
+                                    class="py-2 px-3 bg-emerald-50 hover:bg-[#10A760] text-[#10A760] hover:text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                                    title="Arahkan Rute In-App ke Gedung"
+                                >
+                                    <i class="fa-solid fa-route"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    // =========================================================================
+    // 11. EVENT LISTENERS, ROUTING ENGINE & URL PARAMS
+    // =========================================================================
+    function updateRouteToggleButtonState() {
+        const btn = document.getElementById('map-route-toggle-btn');
+        if (!btn) return;
+        if (routePanelOpen) {
+            btn.classList.add('bg-[#10A760]', 'text-white', 'border-[#10A760]');
+            btn.classList.remove('bg-white/95', 'text-gray-700');
+            const icon = btn.querySelector('i');
+            if (icon) icon.classList.remove('text-[#10A760]');
+        } else {
+            btn.classList.remove('bg-[#10A760]', 'text-white', 'border-[#10A760]');
+            btn.classList.add('bg-white/95', 'text-gray-700');
+            const icon = btn.querySelector('i');
+            if (icon) icon.classList.add('text-[#10A760]');
+        }
+    }
+
+    function emitRouteState(patch = {}) {
+        updateRouteToggleButtonState();
+        window.dispatchEvent(new CustomEvent('usu-route-state-changed', {
+            detail: {
+                isOpen: routePanelOpen,
+                mode: routeMode,
+                originKey: routeOriginKey,
+                originLabel: routeOriginLabel,
+                originSource: routeOriginSource,
+                liveGpsTracking,
+                destinationKey: routeDestinationKey,
+                destinationLabel: routeDestinationLabel,
+                routeResult: currentRouteResult,
+                pickingOriginOnMap,
+                ...patch
+            }
+        }));
+    }
+
+    async function loadRoutingDestinations() {
+        try {
+            const resp = await fetch('/api/routing/destinations', { headers: { Accept: 'application/json' } });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            routingDestinations = {
+                buildings: Array.isArray(data.buildings) ? data.buildings : [],
+                fotocopy: Array.isArray(data.fotocopy) ? data.fotocopy : []
+            };
+            isRoutingDestinationsLoaded = true;
+            window.__usuRoutingDestinations = routingDestinations;
+            window.dispatchEvent(new CustomEvent('usu-routing-destinations-loaded', { detail: routingDestinations }));
+
+            if (pendingInitialRouteRequest) {
+                const req = pendingInitialRouteRequest;
+                pendingInitialRouteRequest = null;
+                startRouteToInternal(req.targetKey, req.options);
+            }
+        } catch (err) {
+            console.warn('[USUClassMap] Gagal memuat daftar tujuan routing:', err);
+        }
+    }
+
+    function resolveEndpointInfo(key) {
+        if (!key) return null;
+        const normalized = String(key).trim();
+
+        const fromCatalog = [...(routingDestinations.buildings || []), ...(routingDestinations.fotocopy || [])]
+            .find((item) => item.key === normalized);
+        if (fromCatalog) {
+            return {
+                key: fromCatalog.key,
+                label: fromCatalog.label,
+                lat: parseFloat(fromCatalog.entrance_lat ?? fromCatalog.lat),
+                lng: parseFloat(fromCatalog.entrance_lng ?? fromCatalog.lng)
+            };
+        }
+
+        if (normalized.startsWith('building:')) {
+            const id = normalized.slice('building:'.length);
+            const b = allBuildings.find((item) => String(item.id) === id);
+            if (b) {
+                return {
+                    key: normalized,
+                    label: b.code ? `${b.code} — ${b.name}` : b.name,
+                    lat: parseFloat(b.entrance_lat ?? b.latitude),
+                    lng: parseFloat(b.entrance_lng ?? b.longitude)
+                };
+            }
+        }
+
+        if (normalized.startsWith('fotocopy:')) {
+            const id = normalized.slice('fotocopy:'.length);
+            const p = allPhotocopyPlaces.find((item) => String(item.id) === id);
+            if (p) {
+                return {
+                    key: normalized,
+                    label: p.name,
+                    lat: parseFloat(p.entrance_lat ?? p.location?.latitude ?? p.latitude),
+                    lng: parseFloat(p.entrance_lng ?? p.location?.longitude ?? p.longitude)
+                };
+            }
+        }
+
+        const match = normalized.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+        if (match) {
+            return {
+                key: normalized,
+                label: `Koordinat (${parseFloat(match[1]).toFixed(5)}, ${parseFloat(match[2]).toFixed(5)})`,
+                lat: parseFloat(match[1]),
+                lng: parseFloat(match[2])
+            };
+        }
+
+        return null;
+    }
+
+    function ensureRouteLayers() {
+        if (window.__usuMapDestroyed || !map || !map.getCanvasContainer() || !map.isStyleLoaded()) {
+            return false;
+        }
+
+        const emptyGeojson = { type: 'FeatureCollection', features: [] };
+
+        if (!map.getSource(GPS_ACCURACY_SOURCE_ID)) {
+            map.addSource(GPS_ACCURACY_SOURCE_ID, { type: 'geojson', data: emptyGeojson });
+        }
+        if (!map.getSource(ROUTE_MAIN_SOURCE_ID)) {
+            map.addSource(ROUTE_MAIN_SOURCE_ID, { type: 'geojson', data: emptyGeojson });
+        }
+        if (!map.getSource(ROUTE_ACCESS_SOURCE_ID)) {
+            map.addSource(ROUTE_ACCESS_SOURCE_ID, { type: 'geojson', data: emptyGeojson });
+        }
+
+        if (!map.getLayer(GPS_ACCURACY_FILL_LAYER_ID)) {
+            map.addLayer({
+                id: GPS_ACCURACY_FILL_LAYER_ID,
+                type: 'fill',
+                source: GPS_ACCURACY_SOURCE_ID,
+                paint: {
+                    'fill-color': '#0284c7',
+                    'fill-opacity': 0.14
+                }
+            });
+        }
+        if (!map.getLayer(GPS_ACCURACY_LINE_LAYER_ID)) {
+            map.addLayer({
+                id: GPS_ACCURACY_LINE_LAYER_ID,
+                type: 'line',
+                source: GPS_ACCURACY_SOURCE_ID,
+                paint: {
+                    'line-color': '#38bdf8',
+                    'line-width': 1.5,
+                    'line-opacity': 0.65
+                }
+            });
+        }
+
+        if (!map.getLayer(ROUTE_ACCESS_LAYER_ID)) {
+            map.addLayer({
+                id: ROUTE_ACCESS_LAYER_ID,
+                type: 'line',
+                source: ROUTE_ACCESS_SOURCE_ID,
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round'
+                },
+                paint: {
+                    'line-color': '#f59e0b',
+                    'line-width': 4,
+                    'line-dasharray': [2, 2],
+                    'line-opacity': 0.95
+                }
+            });
+        }
+
+        if (!map.getLayer(ROUTE_CASING_LAYER_ID)) {
+            map.addLayer({
+                id: ROUTE_CASING_LAYER_ID,
+                type: 'line',
+                source: ROUTE_MAIN_SOURCE_ID,
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round'
+                },
+                paint: {
+                    'line-color': '#ffffff',
+                    'line-width': 10,
+                    'line-opacity': 0.92
+                }
+            });
+        }
+
+        if (!map.getLayer(ROUTE_LINE_LAYER_ID)) {
+            map.addLayer({
+                id: ROUTE_LINE_LAYER_ID,
+                type: 'line',
+                source: ROUTE_MAIN_SOURCE_ID,
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round'
+                },
+                paint: {
+                    'line-color': routeMode === 'driving' ? '#0284c7' : '#10b981',
+                    'line-width': 6,
+                    'line-opacity': 0.98
+                }
+            });
+        }
+
+        if (!map.getLayer(ROUTE_ARROW_LAYER_ID)) {
+            map.addLayer({
+                id: ROUTE_ARROW_LAYER_ID,
+                type: 'symbol',
+                source: ROUTE_MAIN_SOURCE_ID,
+                layout: {
+                    'symbol-placement': 'line',
+                    'symbol-spacing': 55,
+                    'text-field': '>',
+                    'text-size': 14,
+                    'text-keep-upright': false,
+                    'text-allow-overlap': true,
+                    'text-ignore-placement': true
+                },
+                paint: {
+                    'text-color': '#064e3b',
+                    'text-halo-color': '#ffffff',
+                    'text-halo-width': 2
+                }
+            });
+        }
+
+        // Pastikan layer akurasi & garis rute selalu di atas satelit & 3D buildings
+        [
+            GPS_ACCURACY_FILL_LAYER_ID,
+            GPS_ACCURACY_LINE_LAYER_ID,
+            ROUTE_ACCESS_LAYER_ID,
+            ROUTE_CASING_LAYER_ID,
+            ROUTE_LINE_LAYER_ID,
+            ROUTE_ARROW_LAYER_ID
+        ].forEach((layerId) => {
+            try {
+                if (map.getLayer(layerId)) {
+                    map.moveLayer(layerId);
+                }
+            } catch (e) {}
+        });
+
+        try {
+            map.setPaintProperty(ROUTE_LINE_LAYER_ID, 'line-color', routeMode === 'driving' ? '#0284c7' : '#10b981');
+        } catch (e) {}
+
+        return true;
+    }
+
+    function createGeoJsonCirclePolygon(lng, lat, radiusMeters, steps = 48) {
+        const clampedRadius = Math.max(8, Math.min(250, Number(radiusMeters) || 25));
+        const coords = [];
+        const dLat = clampedRadius / 111320.0;
+        const cosLat = Math.max(0.1, Math.cos((lat * Math.PI) / 180));
+        const dLng = clampedRadius / (111320.0 * cosLat);
+
+        for (let i = 0; i <= steps; i++) {
+            const angle = (i / steps) * 2 * Math.PI;
+            coords.push([lng + dLng * Math.cos(angle), lat + dLat * Math.sin(angle)]);
+        }
+
+        return {
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                properties: { radius_m: clampedRadius },
+                geometry: { type: 'Polygon', coordinates: [coords] }
+            }]
+        };
+    }
+
+    function clearGpsVisuals() {
+        if (gpsUserMarker) {
+            try { gpsUserMarker.remove(); } catch (e) {}
+            gpsUserMarker = null;
+        }
+        if (window.__usuMapDestroyed || !map || !map.getCanvasContainer()) return;
+        try {
+            const accSrc = map.getSource(GPS_ACCURACY_SOURCE_ID);
+            if (accSrc) accSrc.setData({ type: 'FeatureCollection', features: [] });
+        } catch (e) {}
+    }
+
+    function renderGpsLocationOnMap(lat, lng, accuracy = 25) {
+        if (window.__usuMapDestroyed || !map || !map.getCanvasContainer()) return;
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+        ensureRouteLayers();
+
+        try {
+            const accSrc = map.getSource(GPS_ACCURACY_SOURCE_ID);
+            if (accSrc) {
+                accSrc.setData(createGeoJsonCirclePolygon(lng, lat, accuracy));
+            }
+        } catch (e) {}
+
+        if (gpsUserMarker) {
+            try { gpsUserMarker.remove(); } catch (e) {}
+        }
+
+        const el = document.createElement('div');
+        el.id = 'usu-gps-user-marker';
+        el.className = 'relative flex items-center justify-center w-6 h-6 pointer-events-none';
+        el.innerHTML = `
+            <span class="usu-gps-pulse-ring absolute inset-0 rounded-full bg-sky-500/45"></span>
+            <span class="relative w-3.5 h-3.5 rounded-full bg-sky-600 border-2 border-white shadow-md"></span>
+        `;
+        gpsUserMarker = new mb.Marker({ element: el, anchor: 'center' })
+            .setLngLat([lng, lat])
+            .addTo(map);
+    }
+
+    function stopLiveGpsTracking() {
+        liveGpsTracking = false;
+        if (window.__usuGpsWatchId !== null && navigator.geolocation) {
+            try {
+                navigator.geolocation.clearWatch(window.__usuGpsWatchId);
+            } catch (e) {}
+            window.__usuGpsWatchId = null;
+        }
+    }
+
+    function clearRouteVisuals() {
+        if (routeOriginMarker) {
+            try { routeOriginMarker.remove(); } catch (e) {}
+            routeOriginMarker = null;
+        }
+        if (routeDestinationMarker) {
+            try { routeDestinationMarker.remove(); } catch (e) {}
+            routeDestinationMarker = null;
+        }
+        if (window.__usuMapDestroyed || !map || !map.getCanvasContainer()) return;
+        const emptyGeojson = { type: 'FeatureCollection', features: [] };
+        try {
+            const mainSrc = map.getSource(ROUTE_MAIN_SOURCE_ID);
+            if (mainSrc) mainSrc.setData(emptyGeojson);
+            const accessSrc = map.getSource(ROUTE_ACCESS_SOURCE_ID);
+            if (accessSrc) accessSrc.setData(emptyGeojson);
+        } catch (e) {}
+    }
+
+    function createRouteEndpointBadgeMarker(labelText, bgClass, lng, lat, offset = [0, 0]) {
+        if (!Number.isFinite(lng) || !Number.isFinite(lat) || !map) return null;
+        const el = document.createElement('div');
+        el.className = `px-2.5 py-1 rounded-full text-[11px] font-black text-white shadow-lg border-2 border-white flex items-center gap-1 pointer-events-none ${bgClass}`;
+        el.innerHTML = `<i class="fa-solid ${labelText === 'Asal' ? 'fa-circle-dot' : 'fa-flag-checkered'}"></i><span>${labelText}</span>`;
+        return new mb.Marker({ element: el, anchor: 'bottom', offset })
+            .setLngLat([lng, lat])
+            .addTo(map);
+    }
+
+    function focusRouteBounds() {
+        if (window.__usuMapDestroyed || !map || !currentRouteResult) return;
+        const bounds = new mb.LngLatBounds();
+        let hasPoints = false;
+
+        const addCoordsFromGeojson = (geo) => {
+            if (!geo) return;
+            if (geo.type === 'Feature' && geo.geometry?.type === 'LineString' && Array.isArray(geo.geometry.coordinates)) {
+                geo.geometry.coordinates.forEach((c) => {
+                    if (Array.isArray(c) && c.length >= 2) {
+                        bounds.extend([c[0], c[1]]);
+                        hasPoints = true;
+                    }
+                });
+                return;
+            }
+            if (!Array.isArray(geo.features)) return;
+            geo.features.forEach((f) => {
+                const coords = f?.geometry?.coordinates || [];
+                if (f?.geometry?.type === 'LineString') {
+                    coords.forEach((c) => {
+                        if (Array.isArray(c) && c.length >= 2) {
+                            bounds.extend([c[0], c[1]]);
+                            hasPoints = true;
+                        }
+                    });
+                }
+            });
+        };
+
+        addCoordsFromGeojson(currentRouteResult.main_route_geojson);
+        addCoordsFromGeojson(currentRouteResult.access_segments_geojson);
+
+        if (hasPoints && !bounds.isEmpty()) {
+            const rightPad = window.innerWidth >= 640 ? 430 : 50;
+            map.fitBounds(bounds, {
+                padding: { top: 85, bottom: 75, left: 60, right: rightPad },
+                maxZoom: 18,
+                pitch: is3DMode ? 35 : 0,
+                duration: 950
+            });
+        }
+    }
+
+    function renderActiveRouteOnMap(fitToBounds = true) {
+        if (window.__usuMapDestroyed || !map || !map.getCanvasContainer()) return;
+        if (!currentRouteResult) {
+            clearRouteVisuals();
+            return;
+        }
+
+        const ready = ensureRouteLayers();
+        if (!ready) {
+            setTimeout(() => {
+                if (!window.__usuMapDestroyed && currentRouteResult) {
+                    renderActiveRouteOnMap(fitToBounds);
+                }
+            }, 250);
+            return;
+        }
+
+        const mainSrc = map.getSource(ROUTE_MAIN_SOURCE_ID);
+        if (mainSrc && currentRouteResult.main_route_geojson) {
+            mainSrc.setData(currentRouteResult.main_route_geojson);
+        }
+        const accessSrc = map.getSource(ROUTE_ACCESS_SOURCE_ID);
+        if (accessSrc && currentRouteResult.access_segments_geojson) {
+            accessSrc.setData(currentRouteResult.access_segments_geojson);
+        }
+
+        if (routeOriginMarker) {
+            try { routeOriginMarker.remove(); } catch (e) {}
+        }
+        if (routeDestinationMarker) {
+            try { routeDestinationMarker.remove(); } catch (e) {}
+        }
+
+        const orig = currentRouteResult.origin || {};
+        const dest = currentRouteResult.destination || {};
+        routeOriginMarker = createRouteEndpointBadgeMarker(
+            'Asal',
+            'bg-emerald-600',
+            parseFloat(orig.raw_lng ?? orig.lng),
+            parseFloat(orig.raw_lat ?? orig.lat),
+            routeOriginSource === 'gps' ? [0, -14] : [0, 0]
+        );
+        routeDestinationMarker = createRouteEndpointBadgeMarker(
+            'Tujuan',
+            'bg-blue-600',
+            parseFloat(dest.raw_lng ?? dest.lng),
+            parseFloat(dest.raw_lat ?? dest.lat)
+        );
+
+        if (fitToBounds) {
+            focusRouteBounds();
+        }
+    }
+
+    async function fetchAndRenderRoute(originKey, destKey, mode = routeMode, options = {}) {
+        if (!originKey || !destKey) {
+            emitRouteState({
+                statusMsg: 'Pilih titik asal dan tujuan terlebih dahulu.',
+                isError: true
+            });
+            return null;
+        }
+
+        routeOriginKey = originKey;
+        routeDestinationKey = destKey;
+        routeMode = mode === 'driving' ? 'driving' : 'walking';
+
+        const origInfo = resolveEndpointInfo(originKey);
+        const destInfo = resolveEndpointInfo(destKey);
+        routeOriginLabel = options.originLabel || routeOriginLabel || origInfo?.label || '';
+        routeDestinationLabel = options.destLabel || destInfo?.label || '';
+
+        emitRouteState({
+            isOpen: true,
+            isLoading: true,
+            isError: false,
+            diagnostic: null,
+            alreadyAtDestinationMsg: '',
+            originKey: routeOriginKey,
+            originLabel: routeOriginLabel,
+            originSource: routeOriginSource,
+            destinationKey: routeDestinationKey,
+            destinationLabel: routeDestinationLabel,
+            statusMsg: 'Menghitung jalur jalan & selasar bebas halangan...'
+        });
+
+        try {
+            const params = new URLSearchParams({
+                origin: originKey,
+                destination: destKey,
+                mode: routeMode
+            });
+            if (routeOriginLabel) {
+                params.set('origin_label', routeOriginLabel);
+            }
+            const resp = await fetch(`/api/route?${params.toString()}`, {
+                headers: { Accept: 'application/json' }
+            });
+            const payload = await resp.json();
+
+            if (payload.status === 'already_at_destination') {
+                currentRouteResult = null;
+                clearRouteVisuals();
+                const destCoord = payload.destination;
+                if (destCoord && map) {
+                    map.flyTo({
+                        center: [parseFloat(destCoord.raw_lng ?? destCoord.lng), parseFloat(destCoord.raw_lat ?? destCoord.lat)],
+                        zoom: 18,
+                        duration: 700
+                    });
+                }
+                emitRouteState({
+                    isOpen: true,
+                    isLoading: false,
+                    routeResult: null,
+                    statusMsg: '',
+                    isError: false,
+                    diagnostic: null,
+                    alreadyAtDestinationMsg: payload.message || 'Anda sudah berada di sekitar lokasi tujuan.'
+                });
+                return payload;
+            }
+
+            if (resp.status === 503 || payload.status === 'external_routing_unavailable') {
+                currentRouteResult = null;
+                clearRouteVisuals();
+                emitRouteState({
+                    isOpen: true,
+                    isLoading: false,
+                    routeResult: null,
+                    statusMsg: '',
+                    isError: false,
+                    diagnostic: {
+                        code: 'EXTERNAL_ROUTING_UNAVAILABLE',
+                        message: payload.message || 'Rute jalan luar kampus tidak tersedia sementara waktu.',
+                        showFallbackButtons: true
+                    }
+                });
+                return null;
+            }
+
+            if (!resp.ok || payload.status !== 'ok') {
+                currentRouteResult = null;
+                clearRouteVisuals();
+                emitRouteState({
+                    isLoading: false,
+                    routeResult: null,
+                    statusMsg: payload.message || 'Gagal menghitung rute kampus.',
+                    isError: true
+                });
+                return null;
+            }
+
+            currentRouteResult = payload;
+            renderActiveRouteOnMap(true);
+            emitRouteState({
+                isOpen: true,
+                isLoading: false,
+                routeResult: payload,
+                originLabel: routeOriginSource === 'gps' ? routeOriginLabel : (payload.origin?.label || routeOriginLabel),
+                destinationLabel: payload.destination?.label || routeDestinationLabel,
+                statusMsg: '',
+                isError: false,
+                diagnostic: null,
+                alreadyAtDestinationMsg: ''
+            });
+            return payload;
+        } catch (err) {
+            console.warn('[USUClassMap] Route request error:', err);
+            currentRouteResult = null;
+            clearRouteVisuals();
+            emitRouteState({
+                isLoading: false,
+                routeResult: null,
+                statusMsg: 'Terjadi gangguan jaringan saat menghitung rute.',
+                isError: true
+            });
+            return null;
+        }
+    }
+
+    function haversineMetersJs(lat1, lng1, lat2, lng2) {
+        const toRad = (deg) => (deg * Math.PI) / 180;
+        const R = 6371000;
+        const dLat = toRad(lat2 - lat1);
+        const dLng = toRad(lng2 - lng1);
+        const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * (Math.sin(dLng / 2) ** 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function mapGeolocationErrorDiagnostic(err) {
+        const code = Number(err?.code || 0);
+        if (code === 1) {
+            return {
+                code: 'PERMISSION_DENIED',
+                message: 'Izin lokasi ditolak browser. Klik ikon gembok/lokasi di sebelah alamat URL lalu izinkan Lokasi, kemudian klik tombol GPS lagi.',
+                showFallbackButtons: true
+            };
+        }
+        return {
+            code: code === 3 ? 'TIMEOUT' : 'POSITION_UNAVAILABLE',
+            message: 'Lokasi perangkat tidak terbaca (di Windows 11 pastikan Settings → Privacy & security → Location aktif). Sementara itu, pilih Gedung Asal atau klik titik di peta.',
+            showFallbackButtons: true
+        };
+    }
+
+    function getCurrentPositionPromise(options) {
+        return new Promise((resolve, reject) => {
+            navigator.geolocation.getCurrentPosition(resolve, reject, options);
+        });
+    }
+
+    /**
+     * 2-Stage Browser Geolocation for Windows laptops & mobile devices:
+     * Stage 1: enableHighAccuracy: true (7s)
+     * Stage 2 fallback on TIMEOUT/POSITION_UNAVAILABLE: enableHighAccuracy: false (10s)
+     */
+    async function requestUserPosition2Stage(forceFresh = false) {
+        if (!window.isSecureContext) {
+            throw {
+                code: 'INSECURE_CONTEXT',
+                message: 'Deteksi lokasi GPS browser membutuhkan koneksi aman HTTPS atau localhost / 127.0.0.1. Sementara itu, pilih Gedung Asal atau klik titik di peta.',
+                showFallbackButtons: true
+            };
+        }
+
+        if (!navigator.geolocation) {
+            throw {
+                code: 'UNSUPPORTED',
+                message: 'Browser ini tidak mendukung API Lokasi (Geolocation). Pilih Gedung Asal atau klik titik di peta.',
+                showFallbackButtons: true
+            };
+        }
+
+        const now = Date.now();
+        if (!forceFresh) {
+            if (lastGpsFix && (now - lastGpsFix.timestamp) < 60000) {
+                return { fix: lastGpsFix, fromCache: true };
+            }
+            const cachedFix = readCachedGpsFromStorage();
+            if (cachedFix) {
+                lastGpsFix = cachedFix;
+                return { fix: cachedFix, fromCache: true };
+            }
+        }
+
+        try {
+            const pos1 = await getCurrentPositionPromise({
+                enableHighAccuracy: true,
+                timeout: 7000,
+                maximumAge: 30000
+            });
+            const fix = {
+                lat: pos1.coords.latitude,
+                lng: pos1.coords.longitude,
+                accuracy: pos1.coords.accuracy || 25,
+                timestamp: Date.now()
+            };
+            lastGpsFix = fix;
+            syncGpsToSessionStorage(fix);
+            return { fix, fromCache: false };
+        } catch (err1) {
+            if (err1 && (err1.code === 2 || err1.code === 3)) {
+                try {
+                    const pos2 = await getCurrentPositionPromise({
+                        enableHighAccuracy: false,
+                        timeout: 10000,
+                        maximumAge: 60000
+                    });
+                    const fix = {
+                        lat: pos2.coords.latitude,
+                        lng: pos2.coords.longitude,
+                        accuracy: pos2.coords.accuracy || 60,
+                        timestamp: Date.now()
+                    };
+                    lastGpsFix = fix;
+                    syncGpsToSessionStorage(fix);
+                    return { fix, fromCache: false };
+                } catch (err2) {
+                    throw mapGeolocationErrorDiagnostic(err2);
+                }
+            }
+            throw mapGeolocationErrorDiagnostic(err1);
+        }
+    }
+
+    function formatGpsOriginLabel(fix) {
+        const acc = Number(fix?.accuracy);
+        if (Number.isFinite(acc) && acc > 0) {
+            return `Lokasi Saya (GPS • ±${Math.round(acc)} m)`;
+        }
+        return 'Lokasi Saya (GPS)';
+    }
+
+    function applyGpsFixAsOrigin(fix, targetDestKey = routeDestinationKey, calculateRoute = true) {
+        const coordKey = `${fix.lat.toFixed(6)},${fix.lng.toFixed(6)}`;
+        const label = formatGpsOriginLabel(fix);
+        routeOriginKey = coordKey;
+        routeOriginLabel = label;
+        routeOriginSource = 'gps';
+
+        syncGpsToSessionStorage(fix);
+
+        renderGpsLocationOnMap(fix.lat, fix.lng, fix.accuracy);
+
+        emitRouteState({
+            isOpen: true,
+            isLocatingGps: false,
+            originKey: routeOriginKey,
+            originLabel: routeOriginLabel,
+            originSource: 'gps',
+            diagnostic: null,
+            alreadyAtDestinationMsg: '',
+            statusMsg: calculateRoute && targetDestKey ? 'Menghitung rute dari lokasi GPS...' : 'Lokasi GPS ditetapkan sebagai titik asal.',
+            isError: false
+        });
+
+        if (calculateRoute && targetDestKey) {
+            fetchAndRenderRoute(routeOriginKey, targetDestKey, routeMode, { originLabel: routeOriginLabel });
+        }
+    }
+
+    async function locateUserAndRoute(targetKey, options = {}) {
+        if (!targetKey) return;
+        const reqId = ++activeLocateRequestId;
+
+        routePanelOpen = true;
+        routeDestinationKey = String(targetKey);
+        if (options.mode) {
+            routeMode = options.mode === 'driving' ? 'driving' : 'walking';
+            routeModeExplicitByUser = true;
+        } else if (!routeModeExplicitByUser) {
+            routeMode = 'walking';
+        }
+
+        const destInfo = resolveEndpointInfo(routeDestinationKey);
+        routeDestinationLabel = destInfo?.label || '';
+
+        if (destInfo && Number.isFinite(destInfo.lat) && Number.isFinite(destInfo.lng) && map) {
+            map.flyTo({
+                center: [destInfo.lng, destInfo.lat],
+                zoom: 17.5,
+                pitch: is3DMode ? DEFAULT_PITCH : 0,
+                duration: 850
+            });
+        }
+
+        if (options.origin) {
+            const origInfo = resolveEndpointInfo(options.origin);
+            routeOriginSource = options.origin.includes(',') ? 'manual_map' : 'manual_entity';
+            routeOriginLabel = origInfo?.label || '';
+            fetchAndRenderRoute(options.origin, routeDestinationKey, routeMode);
+            return;
+        }
+
+        // Preserve explicit manual origin when switching destinations
+        if ((routeOriginSource === 'manual_entity' || routeOriginSource === 'manual_map')
+            && routeOriginKey
+            && routeOriginKey !== routeDestinationKey) {
+            fetchAndRenderRoute(routeOriginKey, routeDestinationKey, routeMode, { originLabel: routeOriginLabel });
+            return;
+        }
+
+        if (options.tryGps === false) {
+            emitRouteState({
+                isOpen: true,
+                destinationKey: routeDestinationKey,
+                destinationLabel: routeDestinationLabel,
+                statusMsg: 'Pilih titik asal (gedung kampus, klik peta, atau GPS) untuk menggambar rute.',
+                isError: false
+            });
+            return;
+        }
+
+        emitRouteState({
+            isOpen: true,
+            isLocatingGps: true,
+            destinationKey: routeDestinationKey,
+            destinationLabel: routeDestinationLabel,
+            routeResult: null,
+            diagnostic: null,
+            alreadyAtDestinationMsg: '',
+            statusMsg: 'Mendeteksi lokasi GPS Anda...',
+            isError: false
+        });
+
+        try {
+            const { fix, fromCache } = await requestUserPosition2Stage(false);
+            if (reqId !== activeLocateRequestId) {
+                return;
+            }
+            applyGpsFixAsOrigin(fix, routeDestinationKey, true);
+
+            if (fromCache) {
+                requestUserPosition2Stage(true)
+                    .then((fresh) => {
+                        if (reqId !== activeLocateRequestId || routeOriginSource !== 'gps') return;
+                        const moved = haversineMetersJs(fix.lat, fix.lng, fresh.fix.lat, fresh.fix.lng);
+                        if (moved >= 15.0) {
+                            applyGpsFixAsOrigin(fresh.fix, routeDestinationKey, !!routeDestinationKey);
+                        }
+                    })
+                    .catch(() => {});
+            }
+        } catch (diag) {
+            if (reqId !== activeLocateRequestId) {
+                return;
+            }
+            currentRouteResult = null;
+            clearRouteVisuals();
+            clearGpsVisuals();
+            if (routeOriginSource === 'gps') {
+                routeOriginKey = '';
+                routeOriginLabel = '';
+                routeOriginSource = 'none';
+            }
+            emitRouteState({
+                isOpen: true,
+                isLocatingGps: false,
+                originKey: routeOriginKey,
+                originLabel: routeOriginLabel,
+                originSource: routeOriginSource,
+                routeResult: null,
+                statusMsg: '',
+                isError: false,
+                diagnostic: diag?.message ? diag : mapGeolocationErrorDiagnostic(diag)
+            });
+        }
+    }
+
+    function startRouteToInternal(targetKey, options = {}) {
+        return locateUserAndRoute(targetKey, options);
+    }
+
+    function handleInitialUrlParams() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const queryParam = urlParams.get('q') || urlParams.get('keyword');
+        const dayParam = urlParams.get('day');
+        const routeToParam = urlParams.get('route_to');
+        const focusBuildingParam = urlParams.get('focus_building');
+        const originParam = urlParams.get('origin');
+        const modeParam = urlParams.get('mode');
+
+        if (queryParam) {
+            activeQuery = queryParam;
+            if (searchInput) {
+                searchInput.value = queryParam;
+                if (clearSearchBtn) clearSearchBtn.style.display = 'block';
+            }
+        }
+
+        if (dayParam && dayFilterContainer) {
+            const btn = dayFilterContainer.querySelector(`button[data-day="${dayParam}"]`);
+            if (btn) {
+                activeDay = dayParam;
+                btn.classList.add('bg-[#10A760]', 'text-white');
+                btn.classList.remove('bg-white', 'text-[#10A760]');
+            }
+        }
+
+        if (queryParam || dayParam) {
+            searchSchedules();
+        }
+
+        if (focusBuildingParam && !routeToParam) {
+            const focusId = parseInt(focusBuildingParam, 10);
+            if (Number.isFinite(focusId) && focusId > 0) {
+                setTimeout(() => {
+                    window.USUClassMap?.focusBuilding?.(focusId);
+                }, 350);
+            }
+        }
+
+        if (routeToParam) {
+            if (routeToParam.startsWith('fotocopy:') && !isPhotocopyLayerActive && window.USUClassMap?.togglePhotocopyLayer) {
+                window.USUClassMap.togglePhotocopyLayer();
+            }
+
+            if (isRoutingDestinationsLoaded) {
+                locateUserAndRoute(routeToParam, {
+                    origin: originParam || undefined,
+                    mode: modeParam || undefined,
+                    tryGps: !originParam
+                });
+            } else {
+                pendingInitialRouteRequest = {
+                    targetKey: routeToParam,
+                    options: {
+                        origin: originParam || undefined,
+                        mode: modeParam || undefined,
+                        tryGps: !originParam
+                    }
+                };
+            }
+        }
+    }
+
+    if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+            activeQuery = e.target.value;
+            if (clearSearchBtn) {
+                clearSearchBtn.style.display = activeQuery ? 'block' : 'none';
+            }
+
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                searchSchedules();
+            }, 400);
+        });
+
+        // Simpan ke riwayat pencarian saat user menekan Enter
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                clearTimeout(debounceTimer);
+                activeQuery = searchInput.value.trim();
+                if (activeQuery.length >= 3) {
+                    saveRecentSearch(activeQuery);
+                }
+                searchSchedules();
+            }
+        });
+    }
+
+    if (searchResultsContainer) {
+        searchResultsContainer.addEventListener('click', () => {
+            if (activeQuery && activeQuery.trim().length >= 3) {
+                saveRecentSearch(activeQuery.trim());
+            }
+        });
+    }
+
+    if (clearSearchBtn) {
+        clearSearchBtn.addEventListener('click', () => {
+            if (searchInput) searchInput.value = '';
+            activeQuery = '';
+            clearSearchBtn.style.display = 'none';
+            searchSchedules();
+        });
+    }
+
+    if (dayFilterContainer) {
+        dayFilterContainer.addEventListener('click', (e) => {
+            const btn = e.target.closest('button[data-day]');
+            if (!btn) return;
+
+            const selectedDay = btn.getAttribute('data-day');
+
+            if (activeDay === selectedDay) {
+                activeDay = '';
+                btn.classList.remove('bg-[#10A760]', 'text-white');
+                btn.classList.add('bg-white', 'text-[#10A760]', 'border-[#10A760]');
+            } else {
+                activeDay = selectedDay;
+                dayFilterContainer.querySelectorAll('button[data-day]').forEach(b => {
+                    b.classList.remove('bg-[#10A760]', 'text-white');
+                    b.classList.add('bg-white', 'text-[#10A760]', 'border-[#10A760]');
+                });
+                btn.classList.add('bg-[#10A760]', 'text-white');
+                btn.classList.remove('bg-white', 'text-[#10A760]');
+            }
+
+            searchSchedules();
+        });
+    }
+
+    // =========================================================================
+    // 12. MULTI-MODE MEDIA MODAL TRIGGER
+    // =========================================================================
+    window.openRoomDetailModal = function(room, building, defaultMode = 'photo') {
+        window.dispatchEvent(new CustomEvent('open-room-detail-modal', {
+            detail: {
+                room: room || {},
+                building: building || {},
+                defaultMode: defaultMode || 'photo'
+            }
+        }));
+    };
+
+    window.openMultimediaModal = function(type, src, title) {
+        window.openRoomDetailModal(
+            { name: title, photo_360: src, photo_360_url: src, video_url: src },
+            {},
+            type === '360' ? '360' : 'video'
+        );
+    };
+
+    // =========================================================================
+    // 13. PHOTOCOPY LAYER (MITRA FOTOKOPI USU INTEGRATION)
+    // =========================================================================
+    async function loadPhotocopyPlaces() {
+        if (allPhotocopyPlaces.length > 0) return allPhotocopyPlaces;
+        try {
+            const resp = await fetch('/api/copy-shops?per_page=200');
+            const json = await resp.json();
+            allPhotocopyPlaces = json.data || [];
+            const badgeEl = document.getElementById('fotocopy-count-badge');
+            const floatingBadge = document.getElementById('floating-photocopy-count');
+            if (badgeEl) badgeEl.textContent = allPhotocopyPlaces.length;
+            if (floatingBadge) floatingBadge.textContent = allPhotocopyPlaces.length;
+            return allPhotocopyPlaces;
+        } catch (e) {
+            console.error('Failed to load photocopy places:', e);
+            return [];
+        }
+    }
+
+    function renderPhotocopyMarkers(places) {
+        if (window.__usuMapDestroyed || !map || typeof map.getCanvasContainer !== 'function' || !map.getCanvasContainer()) return;
+        
+        // Hapus marker fotokopi lama jika ada
+        if (Array.isArray(photocopyMarkers)) {
+            photocopyMarkers.forEach(m => m.remove());
+        } else if (typeof photocopyMarkers === 'object' && photocopyMarkers !== null) {
+            Object.values(photocopyMarkers).forEach(m => m.remove());
+        }
+        photocopyMarkers = [];
+
+        if (!Array.isArray(places) || places.length === 0) return;
+
+        const wib = getCurrentWibParts();
+
+        places.forEach(place => {
+            const lat = parseFloat(place.location?.latitude ?? place.latitude);
+            const lng = parseFloat(place.location?.longitude ?? place.longitude);
+
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                return;
+            }
+
+            const opStatus = evaluatePhotocopyWibStatus(place, wib);
+            const iconEl = createPhotocopyMarkerElement(place, opStatus);
+            const popupContent = formatPhotocopyPopupHtml(place, opStatus);
+
+            const popup = new mb.Popup({
+                className: 'custom-popup usu-custom-popup',
+                maxWidth: '300px',
+                offset: [0, -32],
+                closeButton: true,
+                closeOnClick: false,
+                focusAfterOpen: false
+            }).setHTML(popupContent);
+
+            const mapboxCoord = toMapboxCoord(lat, lng);
+
+            const marker = new mb.Marker({ element: iconEl, anchor: 'bottom' })
+                .setLngLat(mapboxCoord)
+                .setPopup(popup)
+                .addTo(map);
+
+            marker._usuEntityType = 'fotocopy';
+            marker._usuEntityData = place;
+
+            photocopyMarkers.push(marker);
+        });
+    }
+
+    // =========================================================================
+    // 14. PUBLIC API ADAPTER: window.USUClassMap (ZERO BREAKING CHANGES)
+    // =========================================================================
+    window.USUClassMap = {
+        openRoomDetailModal: window.openRoomDetailModal,
+        openMultimediaModal: window.openMultimediaModal,
+        toMapboxCoord: toMapboxCoord,
+        renderPhotocopyMarkers: renderPhotocopyMarkers,
+        getPhotocopyMarkers: () => photocopyMarkers,
+
+        /**
+         * Toggle Layer Mitra Fotokopi Kampus USU
+         */
+        togglePhotocopyLayer: async () => {
+            if (!map) return;
+            isPhotocopyLayerActive = !isPhotocopyLayerActive;
+            const btn = document.getElementById('map-floating-photocopy-btn');
+            const sideBtn = document.getElementById('toggle-fotocopy-btn');
+
+            if (isPhotocopyLayerActive) {
+                const places = await loadPhotocopyPlaces();
+                renderPhotocopyMarkers(places);
+                if (btn) {
+                    btn.classList.add('bg-emerald-600', 'text-white', 'border-emerald-600');
+                    btn.classList.remove('bg-white/95', 'text-gray-700');
+                }
+                if (sideBtn) {
+                    sideBtn.classList.add('bg-emerald-600', 'text-white');
+                    sideBtn.classList.remove('bg-emerald-50', 'text-emerald-800');
+                }
+                if (photocopyMarkers.length > 0) {
+                    const bounds = new mb.LngLatBounds();
+                    places.forEach(p => {
+                        const pLat = parseFloat(p.location?.latitude ?? p.latitude);
+                        const pLng = parseFloat(p.location?.longitude ?? p.longitude);
+                        if (Number.isFinite(pLat) && Number.isFinite(pLng)) {
+                            bounds.extend(toMapboxCoord(pLat, pLng));
+                        }
+                    });
+                    if (!bounds.isEmpty()) {
+                        map.fitBounds(bounds, { padding: 80, maxZoom: 16.5, duration: 1000 });
+                    }
+                }
+            } else {
+                if (Array.isArray(photocopyMarkers)) {
+                    photocopyMarkers.forEach(m => m.remove());
+                } else if (typeof photocopyMarkers === 'object' && photocopyMarkers !== null) {
+                    Object.values(photocopyMarkers).forEach(m => m.remove());
+                }
+                photocopyMarkers = [];
+                if (btn) {
+                    btn.classList.remove('bg-emerald-600', 'text-white', 'border-emerald-600');
+                    btn.classList.add('bg-white/95', 'text-gray-700');
+                }
+                if (sideBtn) {
+                    sideBtn.classList.remove('bg-emerald-600', 'text-white');
+                    sideBtn.classList.add('bg-emerald-50', 'text-emerald-800');
+                }
+            }
+        },
+
+        /**
+         * Smart Focus & Highlight Trigger (Memindahkan target ke index 0 & FlyTo Kamera 3D)
+         */
+        focusBuildingWithTarget: (
+            buildingId, 
+            buildingName, 
+            lat, 
+            lng, 
+            targetRoomId, 
+            targetRoomName, 
+            targetScheduleId = null, 
+            targetCourseCode = null, 
+            targetCourseName = null
+        ) => {
+            if (!map) return;
+
+            let building = null;
+            if (buildingId) {
+                building = allBuildings.find(b => b.id == buildingId);
+            }
+            if (!building && buildingName) {
+                building = allBuildings.find(b => b.name?.toLowerCase() === buildingName.toLowerCase() || b.code?.toLowerCase() === buildingName.toLowerCase());
+            }
+            if (!building && lat && lng) {
+                building = allBuildings.find(b => Math.abs(b.latitude - lat) < 0.0001 && Math.abs(b.longitude - lng) < 0.0001);
+            }
+
+            if (!building) return;
+
+            if (activeQuery && activeQuery.trim().length >= 3) {
+                saveRecentSearch(activeQuery.trim());
+            }
+
+            const targetLat = lat || building.latitude;
+            const targetLng = lng || building.longitude;
+
+            const schedulesForThisBuilding = currentSchedules.filter(s => 
+                (s.gedung?.kode === building.code || s.gedung?.nama === building.name)
+            );
+            const fallbackSchedules = schedulesForThisBuilding.length > 0 
+                ? schedulesForThisBuilding 
+                : (userSchedulesByBuilding[building.code] || userSchedulesByBuilding[building.name] || []);
+
+            const hasMyClass = fallbackSchedules.some(s => s.is_my_class === true);
+
+            // Buat HTML popup baru dengan target di index 0 & disorot
+            const newPopupContent = generateBuildingPopupContent(
+                building, 
+                fallbackSchedules, 
+                hasMyClass, 
+                targetRoomId, 
+                targetRoomName,
+                targetScheduleId,
+                targetCourseCode,
+                targetCourseName
+            );
+
+            // Gerakkan kamera 3D ke lokasi
+            map.flyTo({
+                center: [parseFloat(targetLng), parseFloat(targetLat)],
+                zoom: 18,
+                pitch: DEFAULT_PITCH,
+                bearing: DEFAULT_BEARING,
+                duration: 1200,
+                essential: true
+            });
+
+            const marker = buildingMarkers[building.id];
+            if (marker) {
+                marker._usuPopupMeta = {
+                    schedules: fallbackSchedules,
+                    isUserSchedule: hasMyClass,
+                    targetRoomId,
+                    targetRoomName,
+                    targetScheduleId,
+                    targetCourseCode,
+                    targetCourseName
+                };
+                const existingPopup = marker.getPopup();
+                if (existingPopup) {
+                    existingPopup.setHTML(newPopupContent);
+                    if (!existingPopup.isOpen()) {
+                        marker.togglePopup();
+                    }
+                }
+
+                // Auto-scroll ke kartu ruangan target setelah popup terbuka
+                setTimeout(() => {
+                    const targetCard = document.querySelector('[data-target-room="true"], .target-room-highlight');
+                    if (targetCard) {
+                        targetCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    }
+                }, 350);
+            }
+        },
+
+        focusBuilding: (buildingId) => {
+            if (!map) return;
+            const marker = buildingMarkers[buildingId];
+            if (marker) {
+                const lngLat = marker.getLngLat();
+                map.flyTo({
+                    center: [lngLat.lng, lngLat.lat],
+                    zoom: 18,
+                    pitch: DEFAULT_PITCH,
+                    bearing: DEFAULT_BEARING,
+                    duration: 1000,
+                    essential: true
+                });
+                const popup = marker.getPopup();
+                if (popup && !popup.isOpen()) {
+                    marker.togglePopup();
+                }
+            }
+        },
+
+        focusBuildingByCoordinates: (lat, lng, buildingName, targetRoomId = null, targetRoomName = null, targetScheduleId = null, targetCourseCode = null, targetCourseName = null) => {
+            window.USUClassMap.focusBuildingWithTarget(null, buildingName, lat, lng, targetRoomId, targetRoomName, targetScheduleId, targetCourseCode, targetCourseName);
+        },
+
+        focusUserSchedules: () => {
+            if (!map) return;
+            const bounds = new mb.LngLatBounds();
+            let count = 0;
+
+            allBuildings.forEach(b => {
+                const bSchedules = userSchedulesByBuilding[b.code] || userSchedulesByBuilding[b.name] || [];
+                const hasMyClass = bSchedules.some(s => s.is_my_class === true);
+                if (hasMyClass && b.latitude && b.longitude) {
+                    bounds.extend([parseFloat(b.longitude), parseFloat(b.latitude)]);
+                    count++;
+                }
+            });
+
+            if (count > 0 && !bounds.isEmpty()) {
+                map.fitBounds(bounds, { padding: 60, maxZoom: 17, duration: 1200 });
+
+                const firstBuilding = allBuildings.find(b => {
+                    const bSchedules = userSchedulesByBuilding[b.code] || userSchedulesByBuilding[b.name] || [];
+                    return bSchedules.some(s => s.is_my_class === true);
+                });
+
+                if (firstBuilding && buildingMarkers[firstBuilding.id]) {
+                    setTimeout(() => {
+                        const marker = buildingMarkers[firstBuilding.id];
+                        const popup = marker.getPopup();
+                        if (popup && !popup.isOpen()) {
+                            marker.togglePopup();
+                        }
+                    }, 500);
+                }
+            }
+        },
+
+        applyRecentSearch: (keyword) => {
+            if (searchInput) {
+                searchInput.value = keyword;
+                if (clearSearchBtn) clearSearchBtn.style.display = 'block';
+            }
+            activeQuery = keyword;
+            searchSchedules();
+        },
+
+        clearAllRecentSearches: () => {
+            localStorage.removeItem(RECENT_SEARCHES_KEY);
+            renderRecentSearches();
+        },
+
+        resetFilters: () => {
+            if (searchInput) searchInput.value = '';
+            activeQuery = '';
+            activeDay = '';
+            if (clearSearchBtn) clearSearchBtn.style.display = 'none';
+            if (dayFilterContainer) {
+                dayFilterContainer.querySelectorAll('button[data-day]').forEach(b => {
+                    b.classList.remove('bg-[#10A760]', 'text-white');
+                    b.classList.add('bg-white', 'text-[#10A760]', 'border-[#10A760]');
+                });
+            }
+            searchSchedules();
+        },
+
+        handleBookmarkToggle: (schedule, buttonElement) => {
+            const isNowBookmarked = toggleBookmark(schedule);
+            
+            if (currentSchedules.length > 0) {
+                renderSidebarResults(currentSchedules);
+            }
+
+            if (isNowBookmarked) {
+                buttonElement?.classList.add('text-[#D4A017]');
+                buttonElement?.classList.remove('text-gray-400');
+            }
+        },
+
+        // =====================================================================
+        // HUD SPATIAL EXTENSIONS (HUAWEI C.O.R.E. EXPERIENCE)
+        // =====================================================================
+        togglePerspective: () => {
+            if (!map) return;
+            is3DMode = !is3DMode;
+            const targetPitch = is3DMode ? DEFAULT_PITCH : 0;
+            const targetBearing = is3DMode ? DEFAULT_BEARING : 0;
+
+            map.easeTo({
+                pitch: targetPitch,
+                bearing: targetBearing,
+                duration: 1000
+            });
+
+            if (map.getLayer('3d-buildings')) {
+                map.setLayoutProperty('3d-buildings', 'visibility', (is3DMode && !isSatelliteMode) ? 'visible' : 'none');
+            } else if (is3DMode && !isSatelliteMode) {
+                inject3DBuildingsLayer();
+            }
+
+            const labelEl = document.getElementById('perspective-label');
+            if (labelEl) {
+                labelEl.textContent = is3DMode ? 'Mode 3D' : 'Mode 2D';
+            }
+            const btn = document.getElementById('map-perspective-toggle-btn');
+            if (btn) {
+                if (is3DMode) {
+                    btn.classList.add('text-[#10A760]', 'border-[#10A760]');
+                } else {
+                    btn.classList.remove('text-[#10A760]', 'border-[#10A760]');
+                }
+            }
+        },
+
+        toggleSatelliteMode: () => {
+            if (!map) return;
+            isSatelliteMode = !isSatelliteMode;
+
+            try {
+                localStorage.setItem(SATELLITE_STORAGE_KEY, isSatelliteMode ? 'true' : 'false');
+            } catch (e) {}
+
+            updateSatelliteButtonState();
+
+            if (map.getLayer(SATELLITE_LAYER_ID)) {
+                map.setLayoutProperty(SATELLITE_LAYER_ID, 'visibility', isSatelliteMode ? 'visible' : 'none');
+            } else {
+                injectSatelliteLayer();
+            }
+
+            if (map.getLayer('3d-buildings')) {
+                map.setLayoutProperty('3d-buildings', 'visibility', (is3DMode && !isSatelliteMode) ? 'visible' : 'none');
+            }
+
+            ensureRouteLayers();
+            if (lastGpsFix && routeOriginSource === 'gps') {
+                renderGpsLocationOnMap(lastGpsFix.lat, lastGpsFix.lng, lastGpsFix.accuracy);
+            }
+        },
+
+        openRoutePanel: () => {
+            routePanelOpen = true;
+            emitRouteState({ isOpen: true });
+        },
+
+        closeRoutePanel: () => {
+            routePanelOpen = false;
+            pickingOriginOnMap = false;
+            try {
+                if (map && map.getCanvas()) map.getCanvas().style.cursor = '';
+            } catch (e) {}
+            emitRouteState({ isOpen: false, pickingOriginOnMap: false });
+        },
+
+        toggleRoutePanel: () => {
+            routePanelOpen = !routePanelOpen;
+            if (!routePanelOpen) {
+                pickingOriginOnMap = false;
+                try {
+                    if (map && map.getCanvas()) map.getCanvas().style.cursor = '';
+                } catch (e) {}
+            }
+            emitRouteState({ isOpen: routePanelOpen, pickingOriginOnMap });
+        },
+
+        startRouteTo: (targetKey, options = {}) => {
+            locateUserAndRoute(targetKey, options);
+        },
+
+        selectRouteDestination: (destKey) => {
+            if (!destKey) return;
+            locateUserAndRoute(destKey, {});
+        },
+
+        setManualOrigin: (origKey, customLabel = '', autoCalculate = true) => {
+            activeLocateRequestId++;
+            stopLiveGpsTracking();
+            clearGpsVisuals();
+
+            if (!origKey) {
+                routeOriginKey = '';
+                routeOriginLabel = '';
+                routeOriginSource = 'none';
+                currentRouteResult = null;
+                clearRouteVisuals();
+                emitRouteState({
+                    originKey: '',
+                    originLabel: '',
+                    originSource: 'none',
+                    routeResult: null,
+                    diagnostic: null,
+                    alreadyAtDestinationMsg: '',
+                    statusMsg: '',
+                    isError: false
+                });
+                return;
+            }
+
+            const info = resolveEndpointInfo(origKey);
+            routeOriginKey = origKey;
+            routeOriginLabel = customLabel || info?.label || origKey;
+            routeOriginSource = origKey.includes(',') ? 'manual_map' : 'manual_entity';
+
+            emitRouteState({
+                originKey: routeOriginKey,
+                originLabel: routeOriginLabel,
+                originSource: routeOriginSource,
+                diagnostic: null,
+                alreadyAtDestinationMsg: '',
+                statusMsg: '',
+                isError: false
+            });
+
+            if (autoCalculate && routeDestinationKey) {
+                fetchAndRenderRoute(routeOriginKey, routeDestinationKey, routeMode, { originLabel: routeOriginLabel });
+            }
+        },
+
+        setRouteMode: (nextMode) => {
+            routeMode = nextMode === 'driving' ? 'driving' : 'walking';
+            routeModeExplicitByUser = true;
+            emitRouteState({ mode: routeMode });
+            if (routeOriginKey && routeDestinationKey) {
+                fetchAndRenderRoute(routeOriginKey, routeDestinationKey, routeMode, { originLabel: routeOriginLabel });
+            }
+        },
+
+        useGpsAsOrigin: async () => {
+            const reqId = ++activeLocateRequestId;
+            emitRouteState({
+                isOpen: true,
+                isLocatingGps: true,
+                diagnostic: null,
+                alreadyAtDestinationMsg: '',
+                statusMsg: 'Mengambil koordinat GPS Anda...',
+                isError: false
+            });
+
+            try {
+                const { fix } = await requestUserPosition2Stage(true);
+                if (reqId !== activeLocateRequestId) return;
+                applyGpsFixAsOrigin(fix, routeDestinationKey, !!routeDestinationKey);
+            } catch (diag) {
+                if (reqId !== activeLocateRequestId) return;
+                currentRouteResult = null;
+                clearRouteVisuals();
+                clearGpsVisuals();
+                emitRouteState({
+                    isLocatingGps: false,
+                    routeResult: null,
+                    statusMsg: '',
+                    isError: false,
+                    diagnostic: diag?.message ? diag : mapGeolocationErrorDiagnostic(diag)
+                });
+            }
+        },
+
+        toggleLiveGpsTracking: () => {
+            if (liveGpsTracking) {
+                stopLiveGpsTracking();
+                emitRouteState({ liveGpsTracking: false });
+                return;
+            }
+            if (!window.isSecureContext || !navigator.geolocation) {
+                emitRouteState({
+                    diagnostic: {
+                        code: 'UNSUPPORTED',
+                        message: 'Live tracking GPS membutuhkan browser yang mendukung Geolocation pada localhost/HTTPS.',
+                        showFallbackButtons: true
+                    }
+                });
+                return;
+            }
+            liveGpsTracking = true;
+            emitRouteState({ liveGpsTracking: true });
+            window.__usuGpsWatchId = navigator.geolocation.watchPosition(
+                (pos) => {
+                    if (window.__usuMapDestroyed || routeOriginSource !== 'gps') {
+                        stopLiveGpsTracking();
+                        return;
+                    }
+                    const nextFix = {
+                        lat: pos.coords.latitude,
+                        lng: pos.coords.longitude,
+                        accuracy: pos.coords.accuracy || 25,
+                        timestamp: Date.now()
+                    };
+                    const moved = lastGpsFix
+                        ? haversineMetersJs(lastGpsFix.lat, lastGpsFix.lng, nextFix.lat, nextFix.lng)
+                        : 999;
+                    lastGpsFix = nextFix;
+                    syncGpsToSessionStorage(nextFix);
+                    renderGpsLocationOnMap(nextFix.lat, nextFix.lng, nextFix.accuracy);
+                    refreshDistanceDisplaysOnly();
+                    if (moved >= 15.0 && routeDestinationKey) {
+                        applyGpsFixAsOrigin(nextFix, routeDestinationKey, true);
+                    }
+                },
+                () => {
+                    stopLiveGpsTracking();
+                    emitRouteState({ liveGpsTracking: false });
+                },
+                { enableHighAccuracy: false, maximumAge: 15000, timeout: 10000 }
+            );
+        },
+
+        togglePickOriginOnMap: () => {
+            pickingOriginOnMap = !pickingOriginOnMap;
+            try {
+                if (map && map.getCanvas()) {
+                    map.getCanvas().style.cursor = pickingOriginOnMap ? 'crosshair' : '';
+                }
+            } catch (e) {}
+            emitRouteState({
+                pickingOriginOnMap,
+                diagnostic: pickingOriginOnMap ? null : undefined,
+                statusMsg: pickingOriginOnMap ? 'Klik sembarang titik di peta untuk memilih asal.' : '',
+                isError: false
+            });
+        },
+
+        calculateInAppRoute: (originKey, destKey, mode) => {
+            return fetchAndRenderRoute(originKey, destKey, mode, { originLabel: routeOriginLabel });
+        },
+
+        focusCurrentRoute: () => {
+            focusRouteBounds();
+        },
+
+        focusRouteStep: (step) => {
+            if (!map || !step || !Array.isArray(step.coordinate) || step.coordinate.length < 2) return;
+            map.flyTo({
+                center: [parseFloat(step.coordinate[0]), parseFloat(step.coordinate[1])],
+                zoom: 18.2,
+                pitch: is3DMode ? 45 : 0,
+                duration: 750
+            });
+        },
+
+        clearRoute: () => {
+            activeLocateRequestId++;
+            stopLiveGpsTracking();
+            clearGpsVisuals();
+            currentRouteResult = null;
+            routeOriginKey = '';
+            routeOriginLabel = '';
+            routeOriginSource = 'none';
+            routeDestinationKey = '';
+            routeDestinationLabel = '';
+            pickingOriginOnMap = false;
+            try {
+                if (map && map.getCanvas()) map.getCanvas().style.cursor = '';
+            } catch (e) {}
+            clearRouteVisuals();
+            emitRouteState({
+                routeResult: null,
+                originKey: '',
+                originLabel: '',
+                originSource: 'none',
+                liveGpsTracking: false,
+                destinationKey: '',
+                destinationLabel: '',
+                pickingOriginOnMap: false,
+                diagnostic: null,
+                alreadyAtDestinationMsg: '',
+                statusMsg: '',
+                isError: false
+            });
+        },
+
+        resetCampusView: () => {
+            if (!map) return;
+            is3DMode = true;
+            map.flyTo({
+                center: DEFAULT_CENTER,
+                zoom: DEFAULT_ZOOM,
+                pitch: DEFAULT_PITCH,
+                bearing: DEFAULT_BEARING,
+                essential: true,
+                duration: 1500
+            });
+            const labelEl = document.getElementById('perspective-label');
+            if (labelEl) labelEl.textContent = 'Mode 3D';
+            const btn = document.getElementById('map-perspective-toggle-btn');
+            if (btn) btn.classList.add('text-[#10A760]', 'border-[#10A760]');
+
+            if (map.getLayer('3d-buildings')) {
+                map.setLayoutProperty('3d-buildings', 'visibility', (!isSatelliteMode) ? 'visible' : 'none');
+            } else if (!isSatelliteMode) {
+                inject3DBuildingsLayer();
+            }
+            ensureRouteLayers();
+        },
+
+        retryInitMap: () => {
+            const el = document.getElementById('map');
+            if (el) el.innerHTML = '';
+            initMap();
+        },
+
+        getMap: () => map,
+        getLastGpsFix: () => lastGpsFix,
+        refreshLiveStatuses: refreshOperationalStatusesLive
+    };
+
+    function updateSatelliteButtonState() {
+        const btn = document.getElementById('map-satellite-toggle-btn');
+        const label = document.getElementById('satellite-label');
+        const icon = document.getElementById('satellite-icon');
+
+        if (!btn) return;
+
+        if (isSatelliteMode) {
+            btn.classList.add('bg-slate-900', 'text-white', 'border-slate-700', 'shadow-slate-900/30');
+            btn.classList.remove('bg-white/95', 'text-gray-700', 'border-gray-200');
+            if (icon) {
+                icon.classList.remove('text-cyan-600');
+                icon.classList.add('text-cyan-400');
+            }
+            if (label) {
+                label.textContent = 'Mode Satelit';
+            }
+        } else {
+            btn.classList.remove('bg-slate-900', 'text-white', 'border-slate-700', 'shadow-slate-900/30');
+            btn.classList.add('bg-white/95', 'text-gray-700', 'border-gray-200');
+            if (icon) {
+                icon.classList.remove('text-cyan-400');
+                icon.classList.add('text-cyan-600');
+            }
+            if (label) {
+                label.textContent = 'Satelit';
+            }
+        }
+    }
+
+    // Initialize Mapbox Engine
+    initMap();
+}
+
+// Inisialisasi engine secara tangguh (anti-double initialization)
+let isMapEngineStarted = false;
+function startMapEngine() {
+    if (isMapEngineStarted) return;
+    isMapEngineStarted = true;
+    initMapEngine();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startMapEngine, { once: true });
+} else {
+    startMapEngine();
+}
